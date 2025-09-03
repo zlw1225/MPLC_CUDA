@@ -12,7 +12,7 @@ from utils import *
 
 DEFAULTS = {
     "n_of_modes": 10,
-    "Planes": 7,
+    "Planes": 9,
     "iterations": 300,
     # objective weights
     "alpha": 1.0,
@@ -104,6 +104,15 @@ CFG = parse_cfg()
 # Select device (prefer CUDA)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[MPLC2] Using device: {DEVICE}")
+if DEVICE.type == "cuda":
+    try:
+        name = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        print(f"[MPLC2] GPU: {name}, capability={cap}, torch_cuda={getattr(torch.version, 'cuda', None)}")
+    except Exception as e:
+        print(f"[MPLC2] CUDA detected but failed to query device info: {e}")
+else:
+    print("[MPLC2] CUDA 不可用：将使用 CPU 运行。若期望使用 GPU，请安装 CUDA 版 PyTorch 并确保驱动正确。")
 
 # derived parameters
 reprW, reprH = Nx * pixelSize, Ny * pixelSize
@@ -480,21 +489,20 @@ with torch.no_grad():
     fig2.tight_layout()
     fig2.savefig('results/backward_prephase_1p57.png', dpi=150)
 
-    # 相位图：7 个相位面
-    fig3, axes3 = plt.subplots(2, 4, figsize=(12, 6))
+    # 相位图：相位面数量自适应（按每行 4 列排布）
+    ncols = 4
+    nrows = math.ceil(Planes / ncols)
+    fig3, axes3 = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+    # 将 axes 拉平成 1D，便于按索引逐个填充
+    axes3_flat = np.array(axes3).ravel() if isinstance(axes3, np.ndarray) else np.array([axes3])
     for p in range(Planes):
-        r = p // 4
-        c = p % 4
-        ax = axes3[r, c]
+        ax = axes3_flat[p]
         ax.imshow(Masks[p].detach().cpu().numpy(), cmap='twilight', origin='lower')
         ax.set_title(f'Mask p{p}')
         ax.axis('off')
     # 关掉多余子图
-    if Planes < 8:
-        for k in range(Planes, 8):
-            r = k // 4
-            c = k % 4
-            axes3[r, c].axis('off')
+    for k in range(Planes, nrows*ncols):
+        axes3_flat[k].axis('off')
     fig3.suptitle('Phase masks (radians)')
     fig3.tight_layout()
     fig3.savefig('results/masks_phase_maps.png', dpi=150)
