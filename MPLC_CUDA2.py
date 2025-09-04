@@ -42,6 +42,8 @@ DEFAULTS = {
     # extras
     "plot_results": 0,
     "do_padded_eval": 0,
+    # acceleration
+    "use_amp": 0,  # optional mixed precision (CUDA only); safe with complex ops (no casting for complex)
 }
 
 def parse_cfg() -> dict:
@@ -59,6 +61,7 @@ def parse_cfg() -> dict:
     parser.add_argument("--smoothing_switch", type=int, choices=[0,1], default=None)
     parser.add_argument("--plot_results", type=int, choices=[0,1], default=None)
     parser.add_argument("--do_padded_eval", type=int, choices=[0,1], default=None)
+    parser.add_argument("--use_amp", type=int, choices=[0,1], default=None)
     # floats
     parser.add_argument("--alpha", type=float, default=None)
     parser.add_argument("--beta", type=float, default=None)
@@ -114,6 +117,19 @@ if DEVICE.type == "cuda":
 else:
     print("[MPLC2] CUDA 不可用：将使用 CPU 运行。若期望使用 GPU，请安装 CUDA 版 PyTorch 并确保驱动正确。")
 
+# optional AMP context (only meaningful on CUDA; complex ops keep their dtype)
+from contextlib import nullcontext
+def autocast_if_cuda():
+    use_amp = bool(CFG.get("use_amp", 0))
+    if DEVICE.type == "cuda" and use_amp:
+        # prefer torch.autocast if available
+        if hasattr(torch, "autocast"):
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        else:
+            from torch.cuda.amp import autocast
+            return autocast()
+    return nullcontext()
+
 # derived parameters
 reprW, reprH = Nx * pixelSize, Ny * pixelSize
 crs_delta = 0.0001 * calc_perf_every_it
@@ -143,19 +159,19 @@ gauss_modes = gauss_data['profiles']  # 形状: (L, 10, 512, 512)
 L = min(lp_modes.shape[0], gauss_modes.shape[0], len(lambda_list))
 lambda_list = lambda_list[:L]
 
-Speckle_basis = lp_modes[:L, 0:n_of_modes, :, :]
-Gaussian_basis = gauss_modes[:L, 0:n_of_modes, :, :]
-Speckle_basis_torch = torch.from_numpy(Speckle_basis).to(torch.cdouble).to(DEVICE)
-Gaussian_basis_torch = torch.from_numpy(Gaussian_basis).to(torch.cdouble).to(DEVICE)
+Speckle_basis = lp_modes[:L, 0:n_of_modes, :, :].astype(np.complex64)
+Gaussian_basis = gauss_modes[:L, 0:n_of_modes, :, :].astype(np.complex64)
+Speckle_basis_torch = torch.from_numpy(Speckle_basis).to(DEVICE)
+Gaussian_basis_torch = torch.from_numpy(Gaussian_basis).to(DEVICE)
 
 # 生成多波长高斯mask
-Gaussian_Masks = np.zeros_like(Gaussian_basis, dtype=np.float64)
+Gaussian_Masks = np.zeros_like(Gaussian_basis, dtype=np.float32)
 for l in range(L):
     for m in range(n_of_modes):
         inten = np.abs(Gaussian_basis[l, m, :, :]) ** 2
         thr = 0.05 * np.max(inten)
         Gaussian_Masks[l, m, :, :] = inten > thr
-Gaussian_Masks_torch = torch.from_numpy(Gaussian_Masks).to(torch.double).to(DEVICE)
+Gaussian_Masks_torch = torch.from_numpy(Gaussian_Masks).to(torch.float32).to(DEVICE)
 
 # 若需要pad
 if (Nx > 512) or (Ny > 512):
@@ -165,12 +181,10 @@ if (Nx > 512) or (Ny > 512):
     Gaussian_basis_torch = nn.functional.pad(Gaussian_basis_torch, (pad_x, Nx-512-pad_x, pad_y, Ny-512-pad_y), mode='constant', value=0.+0.j)
     Gaussian_Masks_torch = nn.functional.pad(Gaussian_Masks_torch, (pad_x, Nx-512-pad_x, pad_y, Ny-512-pad_y), mode='constant', value=0.0)
 
-# 多波长下的 phi_bk 与 phi_cr
-phi_bk = torch.ones((Gaussian_Masks_torch.shape[0], Ny, Nx), dtype=torch.double, device=DEVICE) - torch.sum(Gaussian_Masks_torch, axis = 1)
-phi_cr = torch.zeros((Gaussian_Masks_torch.shape[0], n_of_modes, Ny, Nx), dtype = torch.double, device=DEVICE)
-for l in range(Gaussian_Masks_torch.shape[0]):
-    for i in range(n_of_modes):
-        phi_cr[l,i,:,:] = torch.sum(Gaussian_Masks_torch[l], axis = 0) - Gaussian_Masks_torch[l,i,:,:]
+# 多波长下的 phi_bk 与 phi_cr（二值并集/补集定义，避免负值；在掩膜互斥时等价且更稳健）
+sum_masks = torch.sum(Gaussian_Masks_torch, dim=1)  # (L, Ny, Nx)
+phi_bk = (sum_masks == 0).to(torch.float32)  # 背景：未被任何通道覆盖
+phi_cr = ((sum_masks.unsqueeze(1) - Gaussian_Masks_torch) > 0).to(torch.float32)  # 交叉区域：其他通道的并集
 
 phi = Gaussian_basis_torch
 
@@ -180,7 +194,7 @@ phi = Gaussian_basis_torch
 # complim(Speckle_basis_torch[0, :, :])
 
 # plt.title("Sum of the output modes - $\sum\phi_{i}$")
-# complim(torch.sum(phi, axis = 0))
+# complim(torch.sum(phi, dim = 0))
 
 # plt.title("$\phi^{bk}$")
 # complim(phi_bk)
@@ -191,17 +205,17 @@ phi = Gaussian_basis_torch
 
 
 
-Masks = torch.zeros((Planes,Ny,Nx), dtype=torch.double, device=DEVICE) # use zero phases as starting guesses for the phase masks
-Masks_complex = torch.exp(1j*Masks) # complex representation of the phase masks with amplitude = 1 everywhere
+Masks = torch.zeros((Planes, Ny, Nx), dtype=torch.float32, device=DEVICE)  # use zero phases as starting guesses for the phase masks
+Masks_complex = torch.exp(1j * Masks)  # complex representation of the phase masks with amplitude = 1 everywhere
 
 # create placeholder arrays to store every input and every output field in each plane
 L = Gaussian_Masks_torch.shape[0]
-Modes_in = torch.zeros((L, Planes, n_of_modes, Ny, Nx), dtype = torch.cdouble, device=DEVICE)
-Modes_out = torch.zeros((L, Planes, n_of_modes, Ny, Nx), dtype = torch.cdouble, device=DEVICE)
+Modes_in = torch.zeros((L, Planes, n_of_modes, Ny, Nx), dtype=torch.complex64, device=DEVICE)
+Modes_out = torch.zeros((L, Planes, n_of_modes, Ny, Nx), dtype=torch.complex64, device=DEVICE)
 
-overlap = torch.zeros((n_of_modes), dtype = torch.cdouble, device=DEVICE)
-eff_distribution = torch.ones((n_of_modes), dtype = torch.double, device=DEVICE)
-dFdpsi = torch.zeros((L, Planes, n_of_modes, Ny, Nx), dtype = torch.cdouble, device=DEVICE)
+overlap = torch.zeros((n_of_modes), dtype=torch.complex64, device=DEVICE)
+eff_distribution = torch.ones((n_of_modes), dtype=torch.float32, device=DEVICE)
+dFdpsi = torch.zeros((L, Planes, n_of_modes, Ny, Nx), dtype=torch.complex64, device=DEVICE)
 crs_array_convergence = torch.zeros((iterations//calc_perf_every_it), dtype = torch.double, device=DEVICE)
 conv_count = 0
 
@@ -209,8 +223,8 @@ conv_count = 0
 kz_torch_list = []
 for l in range(L):
     k_l = (2*np.pi)/lambda_list[l]
-    kz_l = np.sqrt(k_l**2 - (kx**2 + ky**2))
-    kz_torch_list.append(torch.from_numpy(kz_l.astype(np.cdouble)).to(DEVICE))
+    kz_l = np.lib.scimath.sqrt(k_l**2 - (kx**2 + ky**2)).astype(np.complex64)
+    kz_torch_list.append(torch.from_numpy(kz_l).to(DEVICE))
     Modes_in[l, 0, :, :, :] = propagate_HK(Speckle_basis_torch[l], kz_torch_list[l], d_in)
     # 目标场定义在输出面（距最后一面 d_out 处），用于反向传播到最后一面
     Modes_out[l, Planes-1, :, :, :] = propagate_HK(phi[l], kz_torch_list[l], -d_out)
@@ -229,16 +243,18 @@ for i in range(1, iterations+1):
 
         # 多波长：按 λ 比例缩放相位并分别前后传播
         for l in range(L):
-            scale_l = lambda_c / lambda_list[l]
-            modes = torch.zeros((n_of_modes, Ny, Nx), dtype = torch.cdouble, device=DEVICE)
-            for pl in range(Planes-1):
-                mask_cmplx_l = torch.exp(1j*(Masks[pl, :, :]*scale_l))
-                modes = Modes_in[l, pl, :, :, :] * mask_cmplx_l
-                modes = propagate_HK(modes, kz_torch_list[l], d)
-                Modes_in[l, pl+1, :, :, :] = modes
-            modes_forw_last_plane = Modes_in[l, Planes-1, :, :, :] * torch.exp(1j*(Masks[Planes-1, :, :]*scale_l))
-            # 从最后一面向前传播到真实输出面 z_out
-            eout_l = propagate_HK(modes_forw_last_plane, kz_torch_list[l], d_out)
+            with autocast_if_cuda():
+                scale_l = lambda_c / lambda_list[l]
+                # 预计算所有相位面的复指数，避免重复 exp
+                mask_cmplx_all = [torch.exp(1j*(Masks[pl, :, :]*scale_l)) for pl in range(Planes)]
+                modes = torch.zeros((n_of_modes, Ny, Nx), dtype = torch.complex64, device=DEVICE)
+                for pl in range(Planes-1):
+                    modes = Modes_in[l, pl, :, :, :] * mask_cmplx_all[pl]
+                    modes = propagate_HK(modes, kz_torch_list[l], d)
+                    Modes_in[l, pl+1, :, :, :] = modes
+                modes_forw_last_plane = Modes_in[l, Planes-1, :, :, :] * mask_cmplx_all[Planes-1]
+                # 从最后一面向前传播到真实输出面 z_out
+                eout_l = propagate_HK(modes_forw_last_plane, kz_torch_list[l], d_out)
 
             for j in range(n_of_modes):
                 overlap = torch.sum(torch.squeeze(eout_l[j,:,:]) * torch.conj(torch.squeeze(phi[l,j,:,:])))
@@ -251,50 +267,54 @@ for i in range(1, iterations+1):
             dFdpsi[l, Planes-1, :, :, :] = propagate_HK(dFdpsi[l, Planes-1, :, :, :], kz_torch_list[l], -d_out)
 
             for pl in range(Planes-1, mask_ind, -1):
-                mask_cmplx_l = torch.exp(1j*(Masks[pl, :, :]*scale_l))
-                dFdpsi_prop = dFdpsi[l, pl, :, :, :] * torch.conj(mask_cmplx_l)
+                dFdpsi_prop = dFdpsi[l, pl, :, :, :] * torch.conj(mask_cmplx_all[pl])
                 dFdpsi_prop = propagate_HK(dFdpsi_prop, kz_torch_list[l], -d)
                 dFdpsi[l, pl-1, :, :, :] = dFdpsi_prop
 
-                phi_prop = Modes_out[l, pl, :, :, :] * torch.conj(mask_cmplx_l)
+                phi_prop = Modes_out[l, pl, :, :, :] * torch.conj(mask_cmplx_all[pl])
                 phi_prop = propagate_HK(phi_prop, kz_torch_list[l], -d)
                 Modes_out[l, pl-1, :, :, :] = phi_prop
 
         # if equalize_efficiency is on, make a sum in (1) a weighted sum, where the weights are 1/(relative_efficiency_i) for each particular mode            
         if equalize_efficiency == 1:
-            total_term = torch.zeros((Ny,Nx), dtype=torch.cdouble, device=DEVICE)
+            total_term = torch.zeros((Ny, Nx), dtype=torch.complex64, device=DEVICE)
+            inv_eff = (1.0 / eff_distribution).view(n_of_modes, 1, 1)  # (M,1,1)
             for l in range(L):
                 scale_l = lambda_c / lambda_list[l]
                 mask_cmplx_l = torch.exp(1j*(Masks[mask_ind, :, :]*scale_l))
-                weighted_overlaps = torch.zeros((Ny,Nx), dtype=torch.cdouble, device=DEVICE)
-                for mode in range(n_of_modes):
-                    weighted_overlaps = weighted_overlaps + (1/eff_distribution[mode]) * torch.squeeze(Modes_in[l, mask_ind, mode, :, :]) * torch.conj(torch.squeeze(dFdpsi[l, mask_ind, mode, :, :]))
+                Mi = Modes_in[l, mask_ind]  # (M, Ny, Nx)
+                Gi = dFdpsi[l, mask_ind]    # (M, Ny, Nx)
+                weighted_overlaps = torch.sum(inv_eff * Mi * torch.conj(Gi), dim=0)  # (Ny, Nx)
                 total_term = total_term + mask_cmplx_l * weighted_overlaps
             delta_P = delta_theta*torch.sign(torch.imag(total_term))
         else:
-            total_term = torch.zeros((Ny,Nx), dtype=torch.cdouble, device=DEVICE)
+            total_term = torch.zeros((Ny, Nx), dtype=torch.complex64, device=DEVICE)
             for l in range(L):
                 scale_l = lambda_c / lambda_list[l]
                 mask_cmplx_l = torch.exp(1j*(Masks[mask_ind, :, :]*scale_l))
-                overlaps = torch.sum(torch.squeeze(Modes_in[l, mask_ind, :, :, :]) * torch.conj(torch.squeeze(dFdpsi[l, mask_ind, :, :, :])), axis = 0)
+                Mi = Modes_in[l, mask_ind]   # (M, Ny, Nx)
+                Gi = dFdpsi[l, mask_ind]     # (M, Ny, Nx)
+                overlaps = torch.sum(Mi * torch.conj(Gi), dim=0)
                 total_term = total_term + mask_cmplx_l * overlaps
             delta_P = delta_theta*torch.sign(torch.imag(total_term))
         
         #  if smoothing_switch is on, mask the regions of the phase masks where there is almost no incedent light, based on the overlap of input and output modes at this plane
         if smoothing_switch == 1:
-                ov_sum = torch.zeros((Ny, Nx), dtype=torch.double, device=DEVICE)
+                ov_sum = torch.zeros((Ny, Nx), dtype=torch.float32, device=DEVICE)
                 for l in range(L):
-                    ov_sum = ov_sum + torch.abs(torch.sum(torch.squeeze(Modes_in[l, mask_ind, :, :, :]*torch.conj(Modes_out[l, mask_ind, :, :, :])), axis = 0))
+                    ov_sum = ov_sum + torch.abs(torch.sum(torch.squeeze(Modes_in[l, mask_ind, :, :, :] * torch.conj(Modes_out[l, mask_ind, :, :, :])), dim=0))
                 ovrlp_in_out = ov_sum / L
-                mask_cmplx = ovrlp_in_out*torch.exp(1j*(Masks[mask_ind, :, :] + delta_P)) 
-                mask_cmplx = mask_cmplx + maskOffset
+                mask_cmplx = ovrlp_in_out * torch.exp(1j * (Masks[mask_ind, :, :] + delta_P))
+                # add a tiny real offset in a dtype/device-safe way (optional smoothing bias)
+                if maskOffset != 0:
+                    mask_cmplx = mask_cmplx + torch.tensor(maskOffset, dtype=torch.float32, device=DEVICE)
                 Masks[mask_ind, :, :] = torch.angle(mask_cmplx)
         #  if smoothing_switch is off, just add phase delta_P to a current guess of the certain phase mask
         else:
             Masks[mask_ind, :, :] = Masks[mask_ind, :, :] + delta_P
 
         # store the resulting current guess of the phase mask as a complex array, with amplitude = 1 everywhere
-        Masks_complex[mask_ind, :, :] = torch.exp(1j*torch.squeeze(Masks[mask_ind, :, :]))
+    Masks_complex[mask_ind, :, :] = torch.exp(1j * torch.squeeze(Masks[mask_ind, :, :]))
 
 
     # calculate and print out sorter's performance after every iteration (or every K iterations to save time)
@@ -302,33 +322,36 @@ for i in range(1, iterations+1):
         fids = []
         crss = []
         effs = []
+        eff_lists = []
         for l in range(L):
-            scale_l = lambda_c / lambda_list[l]
-            for pl in range(Planes-1):
-                mask_cmplx_l = torch.exp(1j*(Masks[pl, :, :]*scale_l))
-                modes = Modes_in[l, pl, :, :, :]*mask_cmplx_l
-                modes = propagate_HK(modes, kz_torch_list[l], d)
-                Modes_in[l, pl+1, :, :, :] = modes
-            modes = modes*torch.exp(1j*(Masks[Planes-1, :, :]*scale_l))
-            eout = propagate_HK(modes, kz_torch_list[l], d_out)
-            eout_int_only = (torch.abs(eout))**2
-            fid, _ = performance_loc_fidelity(eout, Gaussian_Masks_torch[l], phi[l]) 
-            crs, _, _ = performance_crosstalk(eout_int_only, Gaussian_Masks_torch[l]) 
-            eff, eff_list = performance_efficiency(eout_int_only, Gaussian_Masks_torch[l])
+            with autocast_if_cuda():
+                scale_l = lambda_c / lambda_list[l]
+                # 复用缓存到最后一面的前向场，避免从 p0 重算
+                modes_last = Modes_in[l, Planes-1, :, :, :]
+                modes_last = modes_last * torch.exp(1j*(Masks[Planes-1, :, :]*scale_l))
+                eout = propagate_HK(modes_last, kz_torch_list[l], d_out)
+                eout_int_only = (torch.abs(eout))**2
+                fid, _ = performance_loc_fidelity(eout, Gaussian_Masks_torch[l], phi[l]) 
+                crs, _, _ = performance_crosstalk(eout_int_only, Gaussian_Masks_torch[l]) 
+                eff, eff_list = performance_efficiency(eout_int_only, Gaussian_Masks_torch[l])
             fids.append(fid); crss.append(crs); effs.append(eff)
+            eff_lists.append(eff_list)
 
         fid = torch.stack(fids).mean(); crs = torch.stack(crss).mean(); eff = torch.stack(effs).mean()
         print('iteration', i, ': loc. fidelity =', round(fid.detach().cpu().numpy().item(),2), ', crosstalk =', round(crs.detach().cpu().numpy().item(),2), ', efficiency =', round(eff.detach().cpu().numpy().item(),2))
         crs_array_convergence[conv_count] = crs # store calculated cross-talk to an array to then plot it against the number of iterations
         
         # stop iterating if the algorithm is no longer improving cross-talk by more than a certain value after a certain iteration
-        if i > (iterations/3) and (crs_array_convergence[conv_count-1] - crs_array_convergence[conv_count]) < crs_delta:
+        if (conv_count > 0) and (i > (iterations/3)) and ((crs_array_convergence[conv_count-1] - crs_array_convergence[conv_count]) < crs_delta):
             break
         conv_count = conv_count + 1
 
         # store a list of a relative efficiency of every output on the current iteration to try to equalize them on the next run
         if equalize_efficiency == 1:
-            eff_distribution = eff_list/torch.max(eff_list)
+            # 跨波长聚合（均值），使均衡对所有 λ 公平；可按需改为中位数
+            eff_stack = torch.stack(eff_lists, dim=0)  # (L, M)
+            eff_mean = torch.mean(eff_stack, dim=0)
+            eff_distribution = torch.clamp(eff_mean / torch.max(eff_mean), min=1e-6)
             # plot efficiency distribution if plot_eff_distribution is on
             if plot_eff_distribution == 1:                    
                 plt.plot(eff_distribution)
@@ -338,13 +361,12 @@ for i in range(1, iterations+1):
         
 fids = []; crss = []; effs = []
 for l in range(L):
-    scale_l = lambda_c / lambda_list[l]
-    for pl in range(Planes-1):
-        modes = Modes_in[l, pl, :, :, :]*torch.exp(1j*(Masks[pl, :, :]*scale_l))
-        modes = propagate_HK(modes, kz_torch_list[l], d)
-        Modes_in[l, pl+1, :, :, :] = modes
-    modes = modes*torch.exp(1j*(Masks[Planes-1, :, :]*scale_l))
-    eout = propagate_HK(modes, kz_torch_list[l], d_out)
+    with autocast_if_cuda():
+        scale_l = lambda_c / lambda_list[l]
+        # 复用缓存到最后一面的前向场，避免从 p0 重算
+        modes_last = Modes_in[l, Planes-1, :, :, :]
+        modes_last = modes_last * torch.exp(1j*(Masks[Planes-1, :, :]*scale_l))
+        eout = propagate_HK(modes_last, kz_torch_list[l], d_out)
     eout_int_only = (torch.abs(eout))**2
     fid, _ = performance_loc_fidelity(eout, Gaussian_Masks_torch[l], phi[l])
     crs, _, _ = performance_crosstalk(eout_int_only, Gaussian_Masks_torch[l])
@@ -367,30 +389,32 @@ if CFG.get("do_padded_eval", 0) == 1:
     newNx = Nx + 400
     newNy = Ny + 400
     l_c = 2 if L >= 3 else 0
-    Modes_in_wide = torch.zeros((Planes,n_of_modes,newNx,newNy), dtype=torch.cdouble)
-    Modes_in_wide[0,:,200:200+Nx,200:200+Ny] = Modes_in[l_c,0,:,:,:]
-    Masks_wide = torch.zeros((Planes,newNy,newNx), dtype = torch.double)
-    Masks_complex_wide = torch.exp(1j*Masks_wide)
-    Masks_complex_wide[:,200:200+Nx,200:200+Ny] = Masks_complex
+    # 注意维度顺序：(Ny, Nx)
+    Modes_in_wide = torch.zeros((Planes, n_of_modes, newNy, newNx), dtype=torch.complex64, device=DEVICE)
+    Modes_in_wide[0,:,200:200+Ny,200:200+Nx] = Modes_in[l_c,0,:,:,:]
+    Masks_wide = torch.zeros((Planes, newNy, newNx), dtype=torch.float32, device=DEVICE)
+    Masks_complex_wide = torch.exp(1j * Masks_wide)
+    Masks_complex_wide[:,200:200+Ny,200:200+Nx] = Masks_complex
     nx_wide = np.linspace(-(newNx-1)/2, (newNx-1)/2, num=newNx)
     ny_wide = np.linspace(-(newNy-1)/2, (newNy-1)/2, num=newNy)
     kx_wide, ky_wide = np.meshgrid(2*np.pi*nx_wide/(newNx*pixelSize),2*np.pi*ny_wide/(newNy*pixelSize))
-    kz_wide = np.sqrt((2*np.pi/lambda_c)**2 - (kx_wide**2 + ky_wide**2)).astype(np.cdouble)
-    kz_torch_wide = torch.from_numpy(kz_wide)
+    kz_wide = np.lib.scimath.sqrt((2*np.pi/lambda_c)**2 - (kx_wide**2 + ky_wide**2)).astype(np.complex64)
+    kz_torch_wide = torch.from_numpy(kz_wide).to(DEVICE)
     for pl in range(Planes-1):
         modes = Modes_in_wide[pl, :, :, :]*Masks_complex_wide[pl, :, :]
         modes = propagate_HK(modes, kz_torch_wide, d)
         Modes_in_wide[pl+1, :, :, :] = modes
     modes = modes*Masks_complex_wide[Planes-1,:,:]
-    modes_cropped = modes[:,200:200+Nx,200:200+Ny]
+    modes_cropped = modes[:,200:200+Ny,200:200+Nx]
     # 在宽域上从最后一面传播到输出面，再裁剪评估
-    eout_wide = propagate_HK(modes, kz_torch_wide, d_out)
-    eout_cropped = eout_wide[:,200:200+Nx,200:200+Ny]
+    with autocast_if_cuda():
+        eout_wide = propagate_HK(modes, kz_torch_wide, d_out)
+    eout_cropped = eout_wide[:,200:200+Ny,200:200+Nx]
     eout_cropped_int_only = (torch.abs(eout_cropped))**2
     fid_wide, _ = performance_loc_fidelity(eout_cropped, Gaussian_Masks_torch[l_c], phi[l_c])
     crs_wide, _, _ = performance_crosstalk(eout_cropped_int_only, Gaussian_Masks_torch[l_c])
     eff_wide, _ = performance_efficiency(eout_cropped_int_only, Gaussian_Masks_torch[l_c])
-    print('performance padded (λc): loc. fidelity =', round(fid_wide.detach().numpy().item(),3), ', crosstalk =', round(crs_wide.detach().numpy().item(),3), ', efficiency =', round(eff_wide.detach().numpy().item(),3))
+    print('performance padded (λc): loc. fidelity =', round(fid_wide.detach().cpu().numpy().item(),3), ', crosstalk =', round(crs_wide.detach().cpu().numpy().item(),3), ', efficiency =', round(eff_wide.detach().cpu().numpy().item(),3))
 
     plt.plot(crs_array_convergence)
     plt.ylabel('avg. crosstalk (avg over λ)')
@@ -462,32 +486,75 @@ with torch.no_grad():
     bwd_maps.append(torch.sum(torch.abs(modes_b) ** 2, dim=0))
     bwd_titles.append('z=0')
 
-    # 画图：前向 9 幅（z=0, p0..p6, z_out）
+    # 画图：前向（自适应子图数量）
     import matplotlib.pyplot as plt
-    fig1, axes1 = plt.subplots(3, 3, figsize=(12, 10))
-    for idx, ax in enumerate(axes1.ravel()):
-        if idx < len(fwd_maps):
-            im = ax.imshow(fwd_maps[idx].detach().cpu().numpy(), cmap='inferno', origin='lower')
-            ax.set_title(fwd_titles[idx])
-            ax.axis('off')
-        else:
-            ax.axis('off')
+    nplots_fwd = len(fwd_maps)
+    ncols = 4
+    nrows = math.ceil(nplots_fwd / ncols)
+    fig1, axes1 = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+    axes1_flat = np.array(axes1).ravel() if isinstance(axes1, np.ndarray) else np.array([axes1])
+    for idx in range(nplots_fwd):
+        ax = axes1_flat[idx]
+        im = ax.imshow(fwd_maps[idx].detach().cpu().numpy(), cmap='inferno', origin='lower')
+        ax.set_title(fwd_titles[idx])
+        ax.axis('off')
+    for k in range(nplots_fwd, nrows*ncols):
+        axes1_flat[k].axis('off')
     fig1.suptitle('Forward pre-phase intensity (λ=1.57 μm)')
     fig1.tight_layout()
     fig1.savefig('results/forward_prephase_1p57.png', dpi=150)
 
-    # 画图：后向 9 幅（z_out, p6..p0, z=0）
-    fig2, axes2 = plt.subplots(3, 3, figsize=(12, 10))
-    for idx, ax in enumerate(axes2.ravel()):
-        if idx < len(bwd_maps):
-            im = ax.imshow(bwd_maps[idx].detach().cpu().numpy(), cmap='inferno', origin='lower')
-            ax.set_title(bwd_titles[idx])
-            ax.axis('off')
-        else:
-            ax.axis('off')
+    # 画图：后向（自适应子图数量）
+    nplots_bwd = len(bwd_maps)
+    ncols = 4
+    nrows = math.ceil(nplots_bwd / ncols)
+    fig2, axes2 = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+    axes2_flat = np.array(axes2).ravel() if isinstance(axes2, np.ndarray) else np.array([axes2])
+    for idx in range(nplots_bwd):
+        ax = axes2_flat[idx]
+        im = ax.imshow(bwd_maps[idx].detach().cpu().numpy(), cmap='inferno', origin='lower')
+        ax.set_title(bwd_titles[idx])
+        ax.axis('off')
+    for k in range(nplots_bwd, nrows*ncols):
+        axes2_flat[k].axis('off')
     fig2.suptitle('Backward pre-phase intensity (λ=1.57 μm)')
     fig2.tight_layout()
     fig2.savefig('results/backward_prephase_1p57.png', dpi=150)
+
+    # 三行 overview：第一行前向，第二行后向按前向顺序反着放（无标题），第三行掩膜居中（少两个，隐藏空位坐标轴）
+    ncols_ovr = len(fwd_maps)
+    fig_ovr, axes_ovr = plt.subplots(3, ncols_ovr, figsize=(3*ncols_ovr, 9))
+    # row 0: forward
+    for c in range(ncols_ovr):
+        ax = axes_ovr[0, c]
+        ax.imshow(fwd_maps[c].detach().cpu().numpy(), cmap='inferno', origin='lower')
+        ax.set_title(fwd_titles[c])
+        ax.axis('off')
+    # row 1: backward, reversed to align positions with forward (no titles)
+    bwd_aligned = list(reversed(bwd_maps))
+    for c in range(min(ncols_ovr, len(bwd_aligned))):
+        ax = axes_ovr[1, c]
+        ax.imshow(bwd_aligned[c].detach().cpu().numpy(), cmap='inferno', origin='lower')
+        ax.axis('off')
+    # row 2: masks centered (Planes = ncols_ovr - 2)
+    start = 1 if ncols_ovr >= 2 else 0
+    for p in range(Planes):
+        c = start + p
+        if c < ncols_ovr:
+            ax = axes_ovr[2, c]
+            ax.imshow(Masks[p].detach().cpu().numpy(), cmap='twilight', origin='lower')
+            ax.axis('off')  # 第三行标题略去
+    # 关闭空白子图（第一行、第二行多余列，以及第三行两侧空位）
+    for c in range(ncols_ovr):
+        if c >= len(fwd_maps):
+            axes_ovr[0, c].axis('off')
+        if c >= len(bwd_aligned):
+            axes_ovr[1, c].axis('off')
+        if c < start or c >= start + Planes:
+            axes_ovr[2, c].axis('off')
+    fig_ovr.suptitle('Overview: forward / backward(aligned) / masks')
+    fig_ovr.tight_layout()
+    fig_ovr.savefig('results/overview_prephase.png', dpi=150)
 
     # 相位图：相位面数量自适应（按每行 4 列排布）
     ncols = 4
@@ -526,11 +593,18 @@ with torch.no_grad():
     crss_l = np.zeros(Nl)
     effs_l = np.zeros(Nl)
 
-    # 预创建子图
-    nrows, ncols = 2, 3
-    fig_cm, axes_cm = plt.subplots(nrows, ncols, figsize=(12, 8))
+    # 预创建子图（自适应 Nl 个波长）
+    ncols = 3
+    nrows = math.ceil(Nl / ncols)
+    fig_cm, axes_cm = plt.subplots(nrows, ncols, figsize=(4*ncols, 3.5*nrows))
+    axes_cm_flat = np.array(axes_cm).ravel() if isinstance(axes_cm, np.ndarray) else np.array([axes_cm])
 
-    for l in range(Nl):
+    for idx in range(nrows * ncols):
+        ax = axes_cm_flat[idx]
+        if idx >= Nl:
+            ax.axis('off')
+            continue
+        l = idx
         kz_l = kz_torch_list[l]
         scale_l = lambda_c / lambda_list[l]
 
@@ -575,13 +649,14 @@ with torch.no_grad():
         effs_l[l] = float(eff_l.detach().cpu().numpy())
 
         # 绘制该波长的耦合矩阵（功率 |C|^2）
-        r = l // ncols
-        c = l % ncols
-        ax = axes_cm[r, c]
-        im = ax.imshow(C2, cmap='magma', origin='lower', aspect='equal')
+        C2_plot = np.flip(C2, axis=1)  # 列翻转显示
+        ax.imshow(C2_plot, cmap='magma', origin='lower', aspect='equal')
         ax.set_title(f'λ={lambda_list[l]*1e6:.3f} μm')
-        ax.set_xlabel('target idx')
-        ax.set_ylabel('input mode')
+        ax.axis('off')
+
+    # 关闭多余子图
+    for k in range(Nl, nrows*ncols):
+        axes_cm_flat[k].axis('off')
 
     fig_cm.suptitle('Coupling matrices |C|^2 across wavelengths')
     fig_cm.tight_layout()
@@ -620,19 +695,19 @@ with torch.no_grad():
         modes_b = modes_b * torch.conj(torch.exp(1j * (Masks[pl] * scale_l)))
     modes_b = propagate_HK(modes_b, kz_l, -d_in)  # at z=0
 
-    # 仅取前 10 个模式（或 n_of_modes 更小者）并绘制强度
-    M = min(10, modes_b.shape[0], n_of_modes)
-    rows, cols = 2, 5
-    fig, axes = plt.subplots(rows, cols, figsize=(14, 6))
-    axes = axes.ravel()
-    for j in range(rows * cols):
-        if j < M:
-            inten = torch.abs(modes_b[j]) ** 2
-            axes[j].imshow(inten.detach().cpu().numpy(), cmap='inferno', origin='lower')
-            axes[j].set_title(f'mode {j} @ z=0')
-            axes[j].axis('off')
-        else:
-            axes[j].axis('off')
+    # 自适应每模式可视化（显示所有可用模式，不新增参数）
+    M = min(modes_b.shape[0], n_of_modes)
+    ncols = min(5, M) if M > 0 else 1
+    nrows = math.ceil(M / ncols) if M > 0 else 1
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
+    axes_flat = np.array(axes).ravel() if isinstance(axes, np.ndarray) else np.array([axes])
+    for j in range(M):
+        inten = torch.abs(modes_b[j]) ** 2
+        axes_flat[j].imshow(inten.detach().cpu().numpy(), cmap='inferno', origin='lower')
+        axes_flat[j].set_title(f'mode {j} @ z=0')
+        axes_flat[j].axis('off')
+    for k in range(M, nrows*ncols):
+        axes_flat[k].axis('off')
     fig.suptitle('Backward to z=0 per-mode intensity (λ=1.57 μm)')
     fig.tight_layout()
     fig.savefig('results/backward_z0_modes_1p57.png', dpi=150)
