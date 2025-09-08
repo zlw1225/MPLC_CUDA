@@ -173,7 +173,8 @@ def _(A: torch.Tensor, channels: torch.Tensor, B: torch.Tensor) -> Union[torch.T
     A = torch.squeeze(A)
     B = torch.squeeze(B)
     CH = torch.squeeze(channels)
-    fid_list = torch.zeros((A.shape[0]))
+    # keep outputs on the same device as inputs to avoid device mismatch
+    fid_list = torch.zeros((A.shape[0]), device=A.device, dtype=torch.float32)
     for i in range(0, A.shape[0]):
         fid_list[i] = loc_fidelity(A[i,:,:], CH[i,:,:], B[i,:,:])
     av_loc_fid = 100*torch.sum(fid_list)/A.shape[0]
@@ -200,7 +201,8 @@ def _(A: np.ndarray, channels: np.ndarray) -> Union[np.ndarray, float]:
 def _(A: torch.Tensor, channels: torch.Tensor) -> Union[torch.Tensor, float]:
     A = torch.squeeze(A)
     CH = torch.squeeze(channels)
-    eff_list = torch.zeros((A.shape[0]))
+    # allocate on same device/dtype as inputs
+    eff_list = torch.zeros((A.shape[0]), device=A.device, dtype=A.dtype)
     for i in range(0, A.shape[0]):
         eff_list[i] = torch.sum(A[i,:,:]*CH[i,:,:])
     av_eff = 100*torch.sum(eff_list)/A.shape[0]
@@ -230,8 +232,9 @@ def _(A: np.ndarray, channels: np.ndarray) -> Union[np.ndarray, np.ndarray, floa
 def _(A: torch.Tensor, channels: torch.Tensor) -> Union[torch.Tensor, torch.Tensor, float]:
     A = torch.squeeze(A)
     CH = torch.squeeze(channels)
-    crs_list = torch.zeros((A.shape[0]))
-    crs_matrix = torch.zeros((A.shape[0],A.shape[0]))
+    # allocate on same device/dtype as inputs
+    crs_list = torch.zeros((A.shape[0]), device=A.device, dtype=A.dtype)
+    crs_matrix = torch.zeros((A.shape[0],A.shape[0]), device=A.device, dtype=A.dtype)
     for i in range(0, A.shape[0]):
         for j in range(0, A.shape[0]):
             crs_matrix[i,j] = torch.sum(A[j,:,:]*CH[i,:,:])
@@ -281,7 +284,7 @@ def _(x: torch.Tensor) -> torch.Tensor:
     B = A*(torch.cos(P + 2*pi/3)/2+0.5)
     
     C = torch.dstack((R, G, B))
-    plt.imshow(C)
+    plt.imshow(C.detach().cpu().numpy())
     plt.show()    
 
 
@@ -302,7 +305,7 @@ def _(x: np.ndarray) -> np.ndarray:
 @plot_in_GS.register
 def _(x: torch.Tensor) -> torch.Tensor:
     x = torch.angle(torch.exp(1j*x))
-    plt.imshow(x, cmap="gray")
+    plt.imshow(x.detach().cpu().numpy(), cmap="gray")
     plt.show()    
 
 
@@ -379,7 +382,7 @@ def _(x: torch.Tensor, y: torch.Tensor, titles: list) -> torch.Tensor:
     fig, axs = plt.subplots(1, 2)
     i = 0
     for ax, interp in zip(axs, titles):
-        ax.imshow(C[i])
+        ax.imshow(C[i].detach().cpu().numpy())
         ax.set_title(interp, fontsize=10)
         i = i+1
     plt.show()
