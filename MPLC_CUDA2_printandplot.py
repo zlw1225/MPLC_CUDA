@@ -1,423 +1,324 @@
-if CFG.get("do_padded_eval", 0) == 1:
-    # 选择中心波长对应索引（更稳健而非固定 2）
-    l_c = int(np.argmin(np.abs(lambda_list - lambda_c))) if len(lambda_list) > 0 else 0
-    scl_c = float(lambda_c / float(lambda_list[l_c])) if len(lambda_list) > 0 else 1.0  # 通常=1
+import math, torch, numpy as np, os, json
+from utils import propagate_HK, performance_loc_fidelity, performance_crosstalk, performance_efficiency
 
-    # 更大的计算视场：上下左右各扩 200 像素（可调）
-    newNx = Nx + 400
-    newNy = Ny + 400
-    pad_x = (newNx - Nx) // 2
-    pad_y = (newNy - Ny) // 2
+# 尝试从当前全局命名空间获取训练阶段对象；若不存在则从磁盘加载必需内容
+g = globals()
+required_vars = ['Masks','LP_basis_torch','phi','Gaussian_Masks_torch','lambda_list','lambda_c','Planes','n_of_modes','pixelSize','d_in','d','d_out','DEVICE']
+missing = [v for v in required_vars if v not in g]
+if missing:
+    # 最低限：加载 run_meta 以获取配置
+    if 'DEVICE' not in g:
+        DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    try:
+        with open(os.path.join('results','run_meta.json'),'r',encoding='utf-8') as f:
+            meta = json.load(f)
+            cfg_loaded = meta.get('cfg',{})
+            pixelSize = cfg_loaded.get('pixelSize',8e-6)
+            Planes = cfg_loaded.get('Planes',9)
+            n_of_modes = cfg_loaded.get('n_of_modes',10)
+            d_in = cfg_loaded.get('d_in',20e-3)
+            d = cfg_loaded.get('d',2*9.7e-3)
+            d_out = cfg_loaded.get('d_out',15e-3)
+    except Exception:
+        pass
+    # 基础波长数组（若缺失）
+    if 'lambda_list' not in g:
+        lambda_list = np.array([1.53e-6,1.55e-6,1.57e-6,1.59e-6,1.61e-6,1.625e-6],dtype=np.float64)
+    if 'lambda_c' not in g:
+        lambda_c = 1.57e-6
+    # 加载相位
+    if 'Masks' not in g:
+        Masks = torch.load('results/masks_full.pt', map_location=DEVICE, weights_only=True)
+    # 若模式与掩膜缺失：尝试加载原 .npz 并按训练脚本逻辑 pad 到当前 Masks 尺寸
+    Ny_full, Nx_full = Masks.shape[-2], Masks.shape[-1]
+    if 'LP_basis_torch' not in g or 'phi' not in g or 'Gaussian_Masks_torch' not in g:
+        # 复用训练使用的数据文件名
+        lp_data = np.load('lp_out_140.npz')
+        gauss_data = np.load('gauss_10x1_70.npz')
+        lp_modes = lp_data['profiles'][:,0:n_of_modes]
+        gauss_modes = gauss_data['Gaussian_basis'][:,0:n_of_modes]
+        gauss_masks = gauss_data['Gaussian_Masks'][:,0:n_of_modes]
+        LP_basis_torch = torch.from_numpy(lp_modes.astype(np.complex64)).to(DEVICE)
+        phi = torch.from_numpy(gauss_modes.astype(np.complex64)).to(DEVICE)
+        Gaussian_Masks_torch = torch.from_numpy(gauss_masks.astype(np.float32)).to(DEVICE)
+        data_size = lp_modes.shape[-1]
+        if (Nx_full>data_size) or (Ny_full>data_size):
+            pad_x = int((Nx_full-data_size)/2); pad_y = int((Ny_full-data_size)/2)
+            pad_tuple = (pad_x, Nx_full-data_size-pad_x, pad_y, Ny_full-data_size-pad_y)
+            def pad_complex(t):
+                r = torch.nn.functional.pad(t.real, pad_tuple); im = torch.nn.functional.pad(t.imag, pad_tuple)
+                return torch.complex(r,im)
+            LP_basis_torch = pad_complex(LP_basis_torch)
+            phi = pad_complex(phi)
+            Gaussian_Masks_torch = torch.nn.functional.pad(Gaussian_Masks_torch, pad_tuple)
 
-    # 宽域 k-空间：在设备上用 torch 构建，与主流程一致（indexing='xy'）
-    nx_w = torch.linspace((-(newNx-1)/2), ((newNx-1)/2), steps=newNx, device=DEVICE, dtype=torch.float32)
-    ny_w = torch.linspace((-(newNy-1)/2), ((newNy-1)/2), steps=newNy, device=DEVICE, dtype=torch.float32)
-    kx1d_w = (2*math.pi) * nx_w / (newNx * pixelSize)
-    ky1d_w = (2*math.pi) * ny_w / (newNy * pixelSize)
-    kx_w, ky_w = torch.meshgrid(kx1d_w, ky1d_w, indexing='xy')  # 形状 (newNy, newNx)
-    kperp2_w = kx_w**2 + ky_w**2
-    k0_c = (2*math.pi) / float(lambda_list[l_c]) if len(lambda_list) > 0 else (2*math.pi) / lambda_c
-    kz_torch_wide = torch.sqrt((k0_c**2 - kperp2_w).to(torch.complex64))  # complex64 on DEVICE
 
-    # 将输入（z=0）嵌入宽域中心，然后在宽域传播 d_in -> 得到 p0 pre-phase
-    modes_wide = torch.zeros((n_of_modes, newNy, newNx), dtype=torch.complex64, device=DEVICE)
-    modes_wide[:, pad_y:pad_y+Ny, pad_x:pad_x+Nx] = Speckle_basis_torch[l_c]
-    modes_wide = propagate_HK(modes_wide, kz_torch_wide, d_in)
+"""后处理：输出 full 与裁剪版本指标 + Overview 图。
+约定：训练脚本已保存 results/masks_full.pt (full 尺寸)。
+这里按用户需求：
+  - baseline 使用内存中的 Masks (full)
+  - crop 尺寸固定 Nx_crop=256, Ny_crop=512 (中心裁剪)
+  - 打印 IL/MDL/XTs/fidelity/crosstalk/efficiency，两组以及 ΔIL / ΔXTs
+  - 生成 overview_full.png 与 overview_cropped.png
+"""
 
-    # 宽域相位面：默认外圈相位为 0，把已优化相位贴到中心，并按 λ 比例缩放（λc 时 ==1）
-    Masks_wide = torch.zeros((Planes, newNy, newNx), dtype=torch.float32, device=DEVICE)
-    Masks_wide[:, pad_y:pad_y+Ny, pad_x:pad_x+Nx] = Masks
-    # per-plane complex phase at λ_c
-    Masks_complex_wide = torch.exp(1j * (Masks_wide * scl_c))
+Nx_crop = 256
+Ny_crop = 512
 
-    # 依次在宽域传播到各平面，再到输出面
-    for pl in range(Planes-1):
-        modes_wide = modes_wide * Masks_complex_wide[pl]
-        modes_wide = propagate_HK(modes_wide, kz_torch_wide, d)
-    modes_wide = modes_wide * Masks_complex_wide[Planes-1]
-    eout_wide = propagate_HK(modes_wide, kz_torch_wide, d_out)
+def central_crop(tensor, crop_h, crop_w):
+    H = tensor.shape[-2]; W = tensor.shape[-1]
+    top = (H - crop_h)//2; left = (W - crop_w)//2
+    return tensor[..., top:top+crop_h, left:left+crop_w]
 
-    # 裁剪到原视场并评估
-    eout_cropped = eout_wide[:, pad_y:pad_y+Ny, pad_x:pad_x+Nx]
-    eout_cropped_int_only = (torch.abs(eout_cropped))**2
-    fid_wide, _ = performance_loc_fidelity(eout_cropped, Gaussian_Masks_torch[l_c], phi[l_c])
-    crs_wide, _, _ = performance_crosstalk(eout_cropped_int_only, Gaussian_Masks_torch[l_c])
-    eff_wide, _ = performance_efficiency(eout_cropped_int_only, Gaussian_Masks_torch[l_c])
-    print('performance padded (λc): loc. fidelity =', round(fid_wide.detach().cpu().numpy().item(),3), ', crosstalk =', round(crs_wide.detach().cpu().numpy().item(),3), ', efficiency =', round(eff_wide.detach().cpu().numpy().item(),3))
+def build_kz(Ny_loc, Nx_loc, wavelength_val):
+    nx_l = torch.linspace(-(Nx_loc-1)/2, (Nx_loc-1)/2, steps=Nx_loc, device=DEVICE, dtype=torch.float32)
+    ny_l = torch.linspace(-(Ny_loc-1)/2, (Ny_loc-1)/2, steps=Ny_loc, device=DEVICE, dtype=torch.float32)
+    kx1d_l = (2*math.pi) * nx_l / (Nx_loc * pixelSize)
+    ky1d_l = (2*math.pi) * ny_l / (Ny_loc * pixelSize)
+    kx_l, ky_l = torch.meshgrid(kx1d_l, ky1d_l, indexing='xy')
+    kperp2 = kx_l**2 + ky_l**2
+    k0 = (2*math.pi) / float(wavelength_val)
+    return torch.sqrt((k0**2 - kperp2).to(torch.complex64))
 
-    # 宽域全谱评估（逐波长打印所需指标）
+def eval_metrics(masks_ph, LP_basis_ref, phi_ref, masks_target):
+    Nl = len(lambda_list)
+    ILs = np.zeros(Nl); MDLs = np.zeros(Nl); XTs_avg = np.zeros(Nl)
+    fid_arr = np.zeros(Nl); crs_arr = np.zeros(Nl); eff_arr = np.zeros(Nl)
+    for l in range(Nl):
+        kz_loc = build_kz(LP_basis_ref.shape[-2], LP_basis_ref.shape[-1], lambda_list[l])
+        scl = lambda_c / lambda_list[l]
+        modes = propagate_HK(LP_basis_ref[l], kz_loc, d_in)
+        for pl in range(Planes-1):
+            modes = modes * torch.exp(1j * (masks_ph[pl] * scl))
+            modes = propagate_HK(modes, kz_loc, d)
+        modes = modes * torch.exp(1j * (masks_ph[Planes-1] * scl))
+        eout = propagate_HK(modes, kz_loc, d_out)
+        # 耦合矩阵
+        E = eout.reshape(n_of_modes, -1)
+        P = phi_ref[l].reshape(n_of_modes, -1)
+        num = E @ torch.conj(P).T
+        normE = torch.sum(torch.abs(E)**2, dim=1)
+        normP = torch.sum(torch.abs(P)**2, dim=1)
+        denom = torch.sqrt(normE[:, None] * normP[None, :]) + 1e-12
+        C = num / denom
+        s = np.linalg.svd(C.detach().cpu().numpy(), compute_uv=False)
+        s2 = s**2
+        ILs[l] = 10 * np.log10(np.mean(s2))
+        MDLs[l] = 10 * np.log10(np.max(s2) / (np.min(s2)+1e-15))
+        C2 = np.abs(C.detach().cpu().numpy())**2
+        totalPower = np.sum(C2, axis=1)
+        signalPower = np.clip(np.diag(C2), 1e-15, None)
+        XTs_avg[l] = 10 * np.log10(np.mean((totalPower - signalPower)/signalPower))
+        # 原函数指标
+        eout_int = (torch.abs(eout))**2
+        fid_l, _ = performance_loc_fidelity(eout, masks_target[l], phi_ref[l])
+        crs_l, _, _ = performance_crosstalk(eout_int, masks_target[l])
+        eff_l, _ = performance_efficiency(eout_int, masks_target[l])
+        fid_arr[l] = float(fid_l.detach().cpu().numpy())
+        crs_arr[l] = float(crs_l.detach().cpu().numpy())
+        eff_arr[l] = float(eff_l.detach().cpu().numpy())
+    return {
+        'IL': ILs, 'MDL': MDLs, 'XTs': XTs_avg,
+        'fid': fid_arr, 'crs': crs_arr, 'eff': eff_arr
+    }
+
+def make_overview(masks_ph, LP_basis_ref, phi_ref, fname):
+    with torch.no_grad():
+        l_idx = int(np.argmin(np.abs(lambda_list - lambda_c)))
+        kz_l = build_kz(LP_basis_ref.shape[-2], LP_basis_ref.shape[-1], lambda_list[l_idx])
+        scl = lambda_c / lambda_list[l_idx]
+        # forward snapshots
+        fwd_titles=[]; fwd_maps=[]
+        modes = LP_basis_ref[l_idx].clone()
+        fwd_maps.append(torch.sum(torch.abs(modes)**2, dim=0)); fwd_titles.append('z=0')
+        modes = propagate_HK(modes, kz_l, d_in)
+        fwd_maps.append(torch.sum(torch.abs(modes)**2, dim=0)); fwd_titles.append('p0 pre')
+        for pl in range(Planes-1):
+            modes = modes * torch.exp(1j*(masks_ph[pl]*scl))
+            modes = propagate_HK(modes, kz_l, d)
+            fwd_maps.append(torch.sum(torch.abs(modes)**2, dim=0)); fwd_titles.append(f'p{pl+1} pre')
+        modes = modes * torch.exp(1j*(masks_ph[Planes-1]*scl))
+        eout = propagate_HK(modes, kz_l, d_out)
+        fwd_maps.append(torch.sum(torch.abs(eout)**2, dim=0)); fwd_titles.append('z_out')
+        # backward snapshots
+        bwd_maps=[]; modes_b = phi_ref[l_idx].clone()
+        bwd_maps.append(torch.sum(torch.abs(modes_b)**2, dim=0))
+        modes_b = propagate_HK(modes_b, kz_l, -d_out)
+        modes_b = modes_b * torch.conj(torch.exp(1j*(masks_ph[Planes-1]*scl)))
+        bwd_maps.append(torch.sum(torch.abs(modes_b)**2, dim=0))
+        for pl in range(Planes-2, -1, -1):
+            modes_b = propagate_HK(modes_b, kz_l, -d)
+            modes_b = modes_b * torch.conj(torch.exp(1j*(masks_ph[pl]*scl)))
+            bwd_maps.append(torch.sum(torch.abs(modes_b)**2, dim=0))
+        modes_b = propagate_HK(modes_b, kz_l, -d_in)
+        bwd_maps.append(torch.sum(torch.abs(modes_b)**2, dim=0))
+        # plot
+        import matplotlib.pyplot as plt
+        ncols_ovr = len(fwd_maps)
+        fig, axes = plt.subplots(3, ncols_ovr, figsize=(3*ncols_ovr, 9))
+        for c in range(ncols_ovr):
+            ax = axes[0,c]; ax.imshow(fwd_maps[c].detach().cpu().numpy(), cmap='viridis', origin='lower'); ax.set_title(fwd_titles[c]); ax.axis('off')
+        bwd_aligned = list(reversed(bwd_maps))
+        for c in range(min(ncols_ovr, len(bwd_aligned))):
+            ax = axes[1,c]; ax.imshow(bwd_aligned[c].detach().cpu().numpy(), cmap='viridis', origin='lower'); ax.axis('off')
+        start = 1 if ncols_ovr >=2 else 0
+        for p in range(Planes):
+            c = start + p
+            if c < ncols_ovr:
+                ax = axes[2,c]; ax.imshow(masks_ph[p].detach().cpu().numpy(), cmap='RdBu_r', origin='lower', vmin=-math.pi, vmax=math.pi); ax.axis('off')
+        fig.suptitle(fname)
+        fig.tight_layout()
+        fig.savefig(f'results/{fname}.png', dpi=150)
+        plt.close(fig)
+
+# ========== Full size metrics ==========
+metrics_full = eval_metrics(Masks, LP_basis_torch, phi, Gaussian_Masks_torch)
+make_overview(Masks, LP_basis_torch, phi, 'overview_full')
+
+# ========== Cropped metrics ==========
+Ny_full, Nx_full = Masks.shape[-2], Masks.shape[-1]
+if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
+    Masks_crop = central_crop(Masks, Ny_crop, Nx_crop)
+    LP_crop = central_crop(LP_basis_torch, Ny_crop, Nx_crop)
+    phi_crop = central_crop(phi, Ny_crop, Nx_crop)
+    Gmask_crop = central_crop(Gaussian_Masks_torch, Ny_crop, Nx_crop)
+    metrics_crop = eval_metrics(Masks_crop, LP_crop, phi_crop, Gmask_crop)
+    make_overview(Masks_crop, LP_crop, phi_crop, 'overview_cropped')
+    # 打印
+    wl_list = [f'{wl*1e6:.3f}' for wl in lambda_list]
+    print('Wavelengths (μm):', wl_list)
+    def _fmt(arr): return [f'{v:.3f}' for v in arr]
+    print('[Full]    IL (dB):', _fmt(metrics_full['IL']))
+    print('[Cropped] IL (dB):', _fmt(metrics_crop['IL']))
+    print('[Full]    XTs (dB):', _fmt(metrics_full['XTs']))
+    print('[Cropped] XTs (dB):', _fmt(metrics_crop['XTs']))
+    print('[Full]    MDL (dB):', _fmt(metrics_full['MDL']))
+    print('[Cropped] MDL (dB):', _fmt(metrics_crop['MDL']))
+    print('[Full]    fidelity :', _fmt(metrics_full['fid']))
+    print('[Cropped] fidelity :', _fmt(metrics_crop['fid']))
+    print('[Full]    crosstalk:', _fmt(metrics_full['crs']))
+    print('[Cropped] crosstalk:', _fmt(metrics_crop['crs']))
+    print('[Full]    efficiency:', _fmt(metrics_full['eff']))
+    print('[Cropped] efficiency:', _fmt(metrics_crop['eff']))
+    # 差值（Cropped - Full）
+    dIL = metrics_crop['IL'] - metrics_full['IL']
+    dXT = metrics_crop['XTs'] - metrics_full['XTs']
+    print('ΔIL (crop-full)  (dB):', _fmt(dIL))
+    print('ΔXTs (crop-full) (dB):', _fmt(dXT))
+    mean_dIL = np.mean(dIL); mean_dXT = np.mean(dXT)
+    print(f'Mean ΔIL={mean_dIL:.3f} dB, Mean ΔXTs={mean_dXT:.3f} dB')
+    if abs(mean_dIL) < 0.1 and abs(mean_dXT) < 0.2:
+        print('[Info] Crop impact negligible (ΔIL<0.1dB & ΔXTs<0.2dB).')
+    # 保存裁剪相位
+    torch.save(Masks_crop.detach().cpu(), 'results/masks_cropped.pt')
+    print('[Save] Cropped phase masks saved to results/masks_cropped.pt')
+
+    # ================== 仅对裁剪结果输出指定四类图像 ==================
+    import matplotlib.pyplot as plt
+    # 1) 裁剪后各平面相位图 (masks_phase_maps.png)
+    ncols_phase = 4
+    nrows_phase = math.ceil(Planes / ncols_phase)
+    fig_phase_maps, axes_phase_maps = plt.subplots(nrows_phase, ncols_phase, figsize=(3*ncols_phase, 3*nrows_phase))
+    axes_phase_flat = np.array(axes_phase_maps).ravel() if isinstance(axes_phase_maps, np.ndarray) else np.array([axes_phase_maps])
+    for p in range(Planes):
+        ax = axes_phase_flat[p]
+        ax.imshow(Masks_crop[p].detach().cpu().numpy(), cmap='twilight', origin='lower', vmin=-math.pi, vmax=math.pi)
+        ax.set_title(f'Mask p{p}')
+        ax.axis('off')
+    for k in range(Planes, nrows_phase*ncols_phase):
+        axes_phase_flat[k].axis('off')
+    fig_phase_maps.suptitle('Cropped phase masks (radians)')
+    fig_phase_maps.tight_layout()
+    fig_phase_maps.savefig('results/masks_phase_maps.png', dpi=150)
+    plt.close(fig_phase_maps)
+
+    # 2) 六个波长耦合矩阵 (coupling_matrices_6wls.png)
     with torch.no_grad():
         Nl = len(lambda_list)
-        ILs_w = np.zeros(Nl)
-        MDLs_w = np.zeros(Nl)
-        XTs_avg_dB_w = np.zeros(Nl)
-        fids_w = np.zeros(Nl)
-        crss_w = np.zeros(Nl)
-        effs_w = np.zeros(Nl)
-
-        for l in range(Nl):
-            scl = float(lambda_c / float(lambda_list[l]))
-            k0 = (2*math.pi) / float(lambda_list[l])
-            kz_torch_wide_l = torch.sqrt((k0**2 - kperp2_w).to(torch.complex64))
-
-            # 从 z=0 的输入场开始在宽域传播
-            modes_w = torch.zeros((n_of_modes, newNy, newNx), dtype=torch.complex64, device=DEVICE)
-            modes_w[:, pad_y:pad_y+Ny, pad_x:pad_x+Nx] = Speckle_basis_torch[l]
-            modes_w = propagate_HK(modes_w, kz_torch_wide_l, d_in)
+        ncols_cpl = 3
+        nrows_cpl = math.ceil(Nl / ncols_cpl)
+        fig_cpl, axes_cpl = plt.subplots(nrows_cpl, ncols_cpl, figsize=(4*ncols_cpl, 3.5*nrows_cpl))
+        axes_cpl_flat = np.array(axes_cpl).ravel() if isinstance(axes_cpl, np.ndarray) else np.array([axes_cpl])
+        for idx in range(nrows_cpl * ncols_cpl):
+            ax = axes_cpl_flat[idx]
+            if idx >= Nl:
+                ax.axis('off')
+                continue
+            l = idx
+            kz_l = build_kz(LP_crop.shape[-2], LP_crop.shape[-1], lambda_list[l])
+            scl_l = lambda_c / lambda_list[l]
+            modes = propagate_HK(LP_crop[l], kz_l, d_in)
             for pl in range(Planes-1):
-                modes_w = modes_w * torch.exp(1j * (Masks_wide[pl] * scl))
-                modes_w = propagate_HK(modes_w, kz_torch_wide_l, d)
-            modes_w = modes_w * torch.exp(1j * (Masks_wide[Planes-1] * scl))
-            eout_w = propagate_HK(modes_w, kz_torch_wide_l, d_out)
-
-            # 裁剪到原视场
-            eout_crop = eout_w[:, pad_y:pad_y+Ny, pad_x:pad_x+Nx]
-
-            # 耦合矩阵与 IL/MDL/XTs_avg_dB（宽域裁剪后）
-            E = eout_crop.reshape(n_of_modes, -1)
-            P = phi[l].reshape(n_of_modes, -1)
+                modes = modes * torch.exp(1j * (Masks_crop[pl] * scl_l))
+                modes = propagate_HK(modes, kz_l, d)
+            modes = modes * torch.exp(1j * (Masks_crop[Planes-1] * scl_l))
+            eout = propagate_HK(modes, kz_l, d_out)
+            E = eout.reshape(n_of_modes, -1)
+            P = phi_crop[l].reshape(n_of_modes, -1)
             num = E @ torch.conj(P).T
             normE = torch.sum(torch.abs(E)**2, dim=1)
             normP = torch.sum(torch.abs(P)**2, dim=1)
             denom = torch.sqrt(normE[:, None] * normP[None, :]) + 1e-12
-            C_np = (num / denom).detach().cpu().numpy()
-            s = np.linalg.svd(C_np, compute_uv=False)
-            s2 = s**2
-            ILs_w[l] = 10 * np.log10(np.mean(s2))
-            MDLs_w[l] = 10 * np.log10(np.max(s2) / (np.min(s2) + 1e-15))
-            C2 = np.abs(C_np)**2
-            totalPower = np.sum(C2, axis=1)
-            signalPower = np.clip(np.diag(C2), 1e-15, None)
-            XTs_avg_dB_w[l] = 10 * np.log10(np.mean((totalPower - signalPower) / signalPower))
-
-            # 原有 mask 指标（fidelity/crosstalk/efficiency）
-            eout_int = (torch.abs(eout_crop))**2
-            fid_l, _ = performance_loc_fidelity(eout_crop, Gaussian_Masks_torch[l], phi[l])
-            crs_l, _, _ = performance_crosstalk(eout_int, Gaussian_Masks_torch[l])
-            eff_l, _ = performance_efficiency(eout_int, Gaussian_Masks_torch[l])
-            fids_w[l] = float(fid_l.detach().cpu().numpy())
-            crss_w[l] = float(crs_l.detach().cpu().numpy())
-            effs_w[l] = float(eff_l.detach().cpu().numpy())
-
-        print('WIDE-FOV | Wavelengths (μm):', [f'{wl*1e6:.3f}' for wl in lambda_list])
-        print('WIDE-FOV | IL (dB):         ', [f'{v:.3f}' for v in ILs_w])
-        print('WIDE-FOV | MDL (dB):        ', [f'{v:.3f}' for v in MDLs_w])
-        print('WIDE-FOV | XTs_avg (dB):    ', [f'{v:.3f}' for v in XTs_avg_dB_w])
-        print('WIDE-FOV | fidelity:        ', [f'{v:.3f}' for v in fids_w])
-        print('WIDE-FOV | crosstalk:       ', [f'{v:.3f}' for v in crss_w])
-        print('WIDE-FOV | efficiency:      ', [f'{v:.3f}' for v in effs_w])
-
-
-# ==========================================
-# Visualization: λ=1.57 μm 前/后向“相位前”分布与相位图
-# - 前向快照: z=0, p0..p6 的 pre-phase (传播到该面, 未乘该面相位), 以及 z_out
-# - 后向快照: z_out, p6..p0 的 pre-phase (从后向传播到该面, 未乘该面相位), 以及 z=0
-# ==========================================
-import os
-os.makedirs('results', exist_ok=True)
-
-with torch.no_grad():
-    # 选择 λ=1.57 μm 的索引
-    l_idx = int(np.argmin(np.abs(lambda_list - lambda_c)))
-    kz_l = kz_torch_list[l_idx]
-    scale_l = lambda_c / lambda_list[l_idx]
-
-    # 前向: 收集相位前快照（总强度=所有模式强度求和）
-    fwd_titles = []
-    fwd_maps = []
-    # z=0
-    modes = Speckle_basis_torch[l_idx].clone()
-    fwd_maps.append(torch.sum(torch.abs(modes) ** 2, dim=0))
-    fwd_titles.append('z=0')
-    # 传播到 p0 (pre-phase)
-    modes = propagate_HK(modes, kz_l, d_in)
-    fwd_maps.append(torch.sum(torch.abs(modes) ** 2, dim=0))
-    fwd_titles.append('p0 pre')
-    # 依次到 p1..p6 的 pre-phase
-    for pl in range(0, Planes-1):  # 到 p1..p6 的pre，需要先在上一面乘相位再传播
-        mask_cmplx = torch.exp(1j * (Masks[pl] * scale_l))
-        modes = modes * mask_cmplx
-        modes = propagate_HK(modes, kz_l, d)
-        fwd_maps.append(torch.sum(torch.abs(modes) ** 2, dim=0))
-        fwd_titles.append(f'p{pl+1} pre')
-    # 输出面 z_out (在 p6 乘相位后传播 d_out)
-    modes = modes * torch.exp(1j * (Masks[Planes-1] * scale_l))
-    modes_out = propagate_HK(modes, kz_l, d_out)
-    fwd_maps.append(torch.sum(torch.abs(modes_out) ** 2, dim=0))
-    fwd_titles.append('z_out')
-
-    # 后向: 从目标输出面场出发，收集各面的 pre-phase
-    bwd_titles = []
-    bwd_maps = []
-    # z_out（目标场）
-    modes_b = phi[l_idx].clone()
-    bwd_maps.append(torch.sum(torch.abs(modes_b) ** 2, dim=0))
-    bwd_titles.append('z_out')
-    # 到 p6 pre：先 -d_out 到 p6 的后相位(post)，再乘 conj(mask6) 得 pre
-    modes_b = propagate_HK(modes_b, kz_l, -d_out)
-    mask6 = torch.exp(1j * (Masks[Planes-1] * scale_l))
-    modes_b = modes_b * torch.conj(mask6)
-    bwd_maps.append(torch.sum(torch.abs(modes_b) ** 2, dim=0))
-    bwd_titles.append('p6 pre')
-    # 依次到 p5..p0 的 pre：每步先 -d 到达上一面的 post，再乘对应 conj(mask) 得 pre
-    for pl in range(Planes-2, -1, -1):  # from p5 down to p0
-        modes_b = propagate_HK(modes_b, kz_l, -d)
-        mask_cmplx = torch.exp(1j * (Masks[pl] * scale_l))
-        modes_b = modes_b * torch.conj(mask_cmplx)
-        bwd_maps.append(torch.sum(torch.abs(modes_b) ** 2, dim=0))
-        bwd_titles.append(f'p{pl} pre')
-    # 最后到 z=0：-d_in 传播
-    modes_b = propagate_HK(modes_b, kz_l, -d_in)
-    bwd_maps.append(torch.sum(torch.abs(modes_b) ** 2, dim=0))
-    bwd_titles.append('z=0')
-
-    # 画图：前向（自适应子图数量）
-    import matplotlib.pyplot as plt
-    nplots_fwd = len(fwd_maps)
-    ncols = 4
-    nrows = math.ceil(nplots_fwd / ncols)
-    fig1, axes1 = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
-    axes1_flat = np.array(axes1).ravel() if isinstance(axes1, np.ndarray) else np.array([axes1])
-    vmax_fwd = max([float(torch.max(m).detach().cpu().numpy()) for m in fwd_maps]) if fwd_maps else 1.0
-    for idx in range(nplots_fwd):
-        ax = axes1_flat[idx]
-        im = ax.imshow(fwd_maps[idx].detach().cpu().numpy(), cmap='inferno', origin='lower')
-        ax.set_title(fwd_titles[idx])
-        ax.axis('off')
-    for k in range(nplots_fwd, nrows*ncols):
-        axes1_flat[k].axis('off')
-    fig1.suptitle('Forward pre-phase intensity (λ=1.57 μm)')
-    fig1.tight_layout()
-    fig1.savefig('results/forward_prephase_1p57.png', dpi=150)
-
-    # 画图：后向（自适应子图数量）
-    nplots_bwd = len(bwd_maps)
-    ncols = 4
-    nrows = math.ceil(nplots_bwd / ncols)
-    fig2, axes2 = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
-    axes2_flat = np.array(axes2).ravel() if isinstance(axes2, np.ndarray) else np.array([axes2])
-    vmax_bwd = max([float(torch.max(m).detach().cpu().numpy()) for m in bwd_maps]) if bwd_maps else 1.0
-    for idx in range(nplots_bwd):
-        ax = axes2_flat[idx]
-        im = ax.imshow(bwd_maps[idx].detach().cpu().numpy(), cmap='inferno', origin='lower')
-        ax.set_title(bwd_titles[idx])
-        ax.axis('off')
-    for k in range(nplots_bwd, nrows*ncols):
-        axes2_flat[k].axis('off')
-    fig2.suptitle('Backward pre-phase intensity (λ=1.57 μm)')
-    fig2.tight_layout()
-    fig2.savefig('results/backward_prephase_1p57.png', dpi=150)
-
-    # 三行 overview：第一行前向，第二行后向按前向顺序反着放（无标题），第三行掩膜居中（少两个，隐藏空位坐标轴）
-    ncols_ovr = len(fwd_maps)
-    fig_ovr, axes_ovr = plt.subplots(3, ncols_ovr, figsize=(3*ncols_ovr, 9))
-    # row 0: forward
-    for c in range(ncols_ovr):
-        ax = axes_ovr[0, c]
-        ax.imshow(fwd_maps[c].detach().cpu().numpy(), cmap='inferno', origin='lower')
-        ax.set_title(fwd_titles[c])
-        ax.axis('off')
-    # row 1: backward, reversed to align positions with forward (no titles)
-    bwd_aligned = list(reversed(bwd_maps))
-    for c in range(min(ncols_ovr, len(bwd_aligned))):
-        ax = axes_ovr[1, c]
-        ax.imshow(bwd_aligned[c].detach().cpu().numpy(), cmap='inferno', origin='lower')
-        ax.axis('off')
-    # row 2: masks centered (Planes = ncols_ovr - 2)
-    start = 1 if ncols_ovr >= 2 else 0
-    for p in range(Planes):
-        c = start + p
-        if c < ncols_ovr:
-            ax = axes_ovr[2, c]
-            ax.imshow(Masks[p].detach().cpu().numpy(), cmap='twilight', origin='lower', vmin=-math.pi, vmax=math.pi)
-            ax.axis('off')  # 第三行标题略去
-    # 关闭空白子图（第一行、第二行多余列，以及第三行两侧空位）
-    for c in range(ncols_ovr):
-        if c >= len(fwd_maps):
-            axes_ovr[0, c].axis('off')
-        if c >= len(bwd_aligned):
-            axes_ovr[1, c].axis('off')
-        if c < start or c >= start + Planes:
-            axes_ovr[2, c].axis('off')
-    fig_ovr.suptitle('Overview: forward / backward(aligned) / masks')
-    fig_ovr.tight_layout()
-    fig_ovr.savefig('results/overview_prephase.png', dpi=150)
-
-    # 相位图：相位面数量自适应（按每行 4 列排布）
-    ncols = 4
-    nrows = math.ceil(Planes / ncols)
-    fig3, axes3 = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
-    # 将 axes 拉平成 1D，便于按索引逐个填充
-    axes3_flat = np.array(axes3).ravel() if isinstance(axes3, np.ndarray) else np.array([axes3])
-    for p in range(Planes):
-        ax = axes3_flat[p]
-        ax.imshow(Masks[p].detach().cpu().numpy(), cmap='twilight', origin='lower', vmin=-math.pi, vmax=math.pi)
-        ax.set_title(f'Mask p{p}')
-        ax.axis('off')
-    # 关掉多余子图
-    for k in range(Planes, nrows*ncols):
-        axes3_flat[k].axis('off')
-    fig3.suptitle('Phase masks (radians)')
-    fig3.tight_layout()
-    fig3.savefig('results/masks_phase_maps.png', dpi=150)
-
-    plt.show()
-
-
-# ==========================================
-# Subplot: 六个波长的耦合矩阵 + 指标 (IL, MDL, XTs_avg_dB, fidelity/crosstalk/efficiency)
-# - 耦合矩阵基于输出面复场与目标复场的归一化内积 C_{m,j}=
-#   <E_out_m, Phi_j>/sqrt(<E_out_m,E_out_m><Phi_j,Phi_j>)
-# - IL=10*log10(mean(s^2)), MDL=10*log10(max(s^2)/min(s^2)), XTs_avg_dB=10*log10(mean(((sum|C|^2 - diag|C|^2)/diag|C|^2)))
-# ==========================================
-with torch.no_grad():
-    Nl = len(lambda_list)
-    modeCount = n_of_modes
-    ILs = np.zeros(Nl)
-    MDLs = np.zeros(Nl)
-    XTs_avg_dB = np.zeros(Nl)
-    fids_l = np.zeros(Nl)
-    crss_l = np.zeros(Nl)
-    effs_l = np.zeros(Nl)
-
-    # 预创建子图（自适应 Nl 个波长）
-    ncols = 3
-    nrows = math.ceil(Nl / ncols)
-    fig_cm, axes_cm = plt.subplots(nrows, ncols, figsize=(4*ncols, 3.5*nrows))
-    axes_cm_flat = np.array(axes_cm).ravel() if isinstance(axes_cm, np.ndarray) else np.array([axes_cm])
-
-    for idx in range(nrows * ncols):
-        ax = axes_cm_flat[idx]
-        if idx >= Nl:
+            C = num / denom
+            C2_plot = np.flip(np.abs(C.detach().cpu().numpy())**2, axis=1)
+            im = ax.imshow(C2_plot, cmap='magma', origin='lower', aspect='equal', vmin=0.0, vmax=1.0)
+            ax.set_title(f'λ={lambda_list[l]*1e6:.3f} μm')
             ax.axis('off')
-            continue
-        l = idx
-        kz_l = kz_torch_list[l]
-        scale_l = lambda_c / lambda_list[l]
+            if idx == 0:
+                fig_cpl.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        for k in range(Nl, nrows_cpl*ncols_cpl):
+            axes_cpl_flat[k].axis('off')
+        fig_cpl.suptitle('Cropped coupling matrices |C|^2')
+        fig_cpl.tight_layout()
+        fig_cpl.savefig('results/coupling_matrices_6wls.png', dpi=150)
+        plt.close(fig_cpl)
 
-        # 前向到输出面
-        modes = propagate_HK(Speckle_basis_torch[l], kz_l, d_in)
-        for pl in range(Planes-1):
-            modes = modes * torch.exp(1j * (Masks[pl] * scale_l))
-            modes = propagate_HK(modes, kz_l, d)
-        modes = modes * torch.exp(1j * (Masks[Planes-1] * scale_l))
-        eout = propagate_HK(modes, kz_l, d_out)  # (M, Ny, Nx)
+    # 3) & 4) λ=1.57 μm 反向传播到 z=0 的每模式强度与相位
+    with torch.no_grad():
+        l_idx = int(np.argmin(np.abs(lambda_list - lambda_c)))
+        kz_l = build_kz(LP_crop.shape[-2], LP_crop.shape[-1], lambda_list[l_idx])
+        scl_l = lambda_c / lambda_list[l_idx]
+        modes_b = phi_crop[l_idx].clone()
+        modes_b = propagate_HK(modes_b, kz_l, -d_out)
+        modes_b = modes_b * torch.conj(torch.exp(1j * (Masks_crop[Planes-1] * scl_l)))
+        for pl in range(Planes-2, -1, -1):
+            modes_b = propagate_HK(modes_b, kz_l, -d)
+            modes_b = modes_b * torch.conj(torch.exp(1j * (Masks_crop[pl] * scl_l)))
+        modes_b = propagate_HK(modes_b, kz_l, -d_in)
+        Mloc = min(modes_b.shape[0], n_of_modes)
+        ncols_bw = min(5, Mloc) if Mloc>0 else 1
+        nrows_bw = math.ceil(Mloc / ncols_bw) if Mloc>0 else 1
+        # 强度
+        fig_bw_I, axes_bw_I = plt.subplots(nrows_bw, ncols_bw, figsize=(3*ncols_bw, 3*nrows_bw))
+        axes_bw_I_flat = np.array(axes_bw_I).ravel() if isinstance(axes_bw_I, np.ndarray) else np.array([axes_bw_I])
+        vmax_I = max([float(torch.max(torch.abs(modes_b[j])**2).detach().cpu().numpy()) for j in range(Mloc)]) if Mloc>0 else 1.0
+        for j in range(Mloc):
+            inten = torch.abs(modes_b[j])**2
+            axes_bw_I_flat[j].imshow(inten.detach().cpu().numpy(), cmap='inferno', origin='lower', vmin=0.0, vmax=vmax_I)
+            axes_bw_I_flat[j].set_title(f'mode {j} @ z=0')
+            axes_bw_I_flat[j].axis('off')
+        for k in range(Mloc, nrows_bw*ncols_bw):
+            axes_bw_I_flat[k].axis('off')
+        fig_bw_I.suptitle('Cropped backward z0 intensity (λ=1.57 μm)')
+        fig_bw_I.tight_layout()
+        fig_bw_I.savefig('results/backward_z0_modes_1p57.png', dpi=150)
+        plt.close(fig_bw_I)
+        # 相位
+        fig_bw_P, axes_bw_P = plt.subplots(nrows_bw, ncols_bw, figsize=(3*ncols_bw, 3*nrows_bw))
+        axes_bw_P_flat = np.array(axes_bw_P).ravel() if isinstance(axes_bw_P, np.ndarray) else np.array([axes_bw_P])
+        for j in range(Mloc):
+            ph = torch.angle(modes_b[j])
+            axes_bw_P_flat[j].imshow(ph.detach().cpu().numpy(), cmap='twilight', origin='lower', vmin=-math.pi, vmax=math.pi)
+            axes_bw_P_flat[j].set_title(f'mode {j} phase @ z=0')
+            axes_bw_P_flat[j].axis('off')
+        for k in range(Mloc, nrows_bw*ncols_bw):
+            axes_bw_P_flat[k].axis('off')
+        fig_bw_P.suptitle('Cropped backward z0 phase (λ=1.57 μm)')
+        fig_bw_P.tight_layout()
+        fig_bw_P.savefig('results/backward_z0_modes_phase_1p57.png', dpi=150)
+        plt.close(fig_bw_P)
 
-        # 基于复内积构建耦合矩阵 C (M×M)
-        E = eout.reshape(modeCount, -1)
-        P = phi[l].reshape(modeCount, -1)
-        num = E @ torch.conj(P).T  # (M,M)
-        normE = torch.sum(torch.abs(E)**2, dim=1)  # (M,)
-        normP = torch.sum(torch.abs(P)**2, dim=1)  # (M,)
-        denom = torch.sqrt(normE[:, None] * normP[None, :]) + 1e-12
-        C = num / denom
+else:
+    print('[Warn] Crop size larger than full size; skipping crop metrics.')
 
-        # IL / MDL from SVD of C
-        C_np = C.detach().cpu().numpy()
-        s = np.linalg.svd(C_np, compute_uv=False)  # singular values
-        s2 = s**2
-        ILs[l] = 10 * np.log10(np.mean(s2))
-        MDLs[l] = 10 * np.log10(np.max(s2) / (np.min(s2) + 1e-15))
-
-        # XTs (per mode) and XTs_avg_dB
-        C2 = np.abs(C_np)**2
-        totalPower = np.sum(C2, axis=1)
-        signalPower = np.clip(np.diag(C2), 1e-15, None)
-        XTs_modes = (totalPower - signalPower) / signalPower
-        XTs_avg_dB[l] = 10 * np.log10(np.mean(XTs_modes))
-
-        # 同时计算 fidelity/crosstalk/efficiency（基于 mask 的原函数）
-        eout_int = (torch.abs(eout))**2
-        fid_l, _ = performance_loc_fidelity(eout, Gaussian_Masks_torch[l], phi[l])
-        crs_l, _, _ = performance_crosstalk(eout_int, Gaussian_Masks_torch[l])
-        eff_l, _ = performance_efficiency(eout_int, Gaussian_Masks_torch[l])
-        fids_l[l] = float(fid_l.detach().cpu().numpy())
-        crss_l[l] = float(crs_l.detach().cpu().numpy())
-        effs_l[l] = float(eff_l.detach().cpu().numpy())
-
-        # 绘制该波长的耦合矩阵（功率 |C|^2）
-        C2_plot = np.flip(C2, axis=1)  # 列翻转显示
-        im = ax.imshow(C2_plot, cmap='magma', origin='lower', aspect='equal', vmin=0.0, vmax=1.0)
-        ax.set_title(f'λ={lambda_list[l]*1e6:.3f} μm')
-        ax.axis('off')
-        # 仅为第一行的第一个子图添加色标，避免太多 colorbar
-        if idx == 0:
-            fig_cm.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    # 关闭多余子图
-    for k in range(Nl, nrows*ncols):
-        axes_cm_flat[k].axis('off')
-
-    fig_cm.suptitle('Coupling matrices |C|^2 across wavelengths')
-    fig_cm.tight_layout()
-    fig_cm.savefig('results/coupling_matrices_6wls.png', dpi=150)
-    plt.show()
-
-    # 打印表格型结果（简洁版）
-    print('Wavelengths (μm):', [f'{wl*1e6:.3f}' for wl in lambda_list])
-    print('IL (dB):         ', [f'{v:.3f}' for v in ILs])
-    print('MDL (dB):        ', [f'{v:.3f}' for v in MDLs])
-    print('XTs_avg (dB):    ', [f'{v:.3f}' for v in XTs_avg_dB])
-    print('fidelity:        ', [f'{v:.3f}' for v in fids_l])
-    print('crosstalk:       ', [f'{v:.3f}' for v in crss_l])
-    print('efficiency:      ', [f'{v:.3f}' for v in effs_l])
-
-
-# ==========================================
-# 追加可视化：λ=1.57 μm 时，10 个模式反向传播到 z=0 的强度图
-# 结果保存：results/backward_z0_modes_1p57.png
-# ==========================================
-with torch.no_grad():
-    import os
-    os.makedirs('results', exist_ok=True)
-
-    # 选择 λ=1.57 μm 对应索引与缩放
-    l_idx = int(np.argmin(np.abs(lambda_list - lambda_c)))
-    kz_l = kz_torch_list[l_idx]
-    scale_l = lambda_c / lambda_list[l_idx]
-
-    # 从目标面出发，逐面反向传播到 z=0（逐模式并行）
-    modes_b = phi[l_idx].clone()  # (M, Ny, Nx)
-    modes_b = propagate_HK(modes_b, kz_l, -d_out)
-    modes_b = modes_b * torch.conj(torch.exp(1j * (Masks[Planes-1] * scale_l)))
-    for pl in range(Planes-2, -1, -1):
-        modes_b = propagate_HK(modes_b, kz_l, -d)
-        modes_b = modes_b * torch.conj(torch.exp(1j * (Masks[pl] * scale_l)))
-    modes_b = propagate_HK(modes_b, kz_l, -d_in)  # at z=0
-
-    # 自适应每模式可视化（显示所有可用模式，不新增参数）
-    M = min(modes_b.shape[0], n_of_modes)
-    ncols = min(5, M) if M > 0 else 1
-    nrows = math.ceil(M / ncols) if M > 0 else 1
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
-    axes_flat = np.array(axes).ravel() if isinstance(axes, np.ndarray) else np.array([axes])
-    # 固定可视化范围
-    vmax_z0 = max([float(torch.max(torch.abs(modes_b[j])**2).detach().cpu().numpy()) for j in range(M)]) if M > 0 else 1.0
-    for j in range(M):
-        inten = torch.abs(modes_b[j]) ** 2
-        axes_flat[j].imshow(inten.detach().cpu().numpy(), cmap='inferno', origin='lower', vmin=0.0, vmax=vmax_z0)
-        axes_flat[j].set_title(f'mode {j} @ z=0')
-        axes_flat[j].axis('off')
-    for k in range(M, nrows*ncols):
-        axes_flat[k].axis('off')
-    fig.suptitle('Backward to z=0 per-mode intensity (λ=1.57 μm)')
-    fig.tight_layout()
-    fig.savefig('results/backward_z0_modes_1p57.png', dpi=150)
-    plt.show()
-
-    # 可视化每个模式在 z=0 处的相位分布
-    fig_phase, axes_phase = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
-    axes_phase_flat = np.array(axes_phase).ravel() if isinstance(axes_phase, np.ndarray) else np.array([axes_phase])
-    for j in range(M):
-        phase = torch.angle(modes_b[j])  # 相位范围 [-π, π]
-        axes_phase_flat[j].imshow(phase.detach().cpu().numpy(), cmap='twilight', origin='lower', vmin=-math.pi, vmax=math.pi)
-        axes_phase_flat[j].set_title(f'mode {j} phase @ z=0')
-        axes_phase_flat[j].axis('off')
-    for k in range(M, nrows*ncols):
-        axes_phase_flat[k].axis('off')
-    fig_phase.suptitle('Backward to z=0 per-mode phase (λ=1.57 μm)')
-    fig_phase.tight_layout()
-    fig_phase.savefig('results/backward_z0_modes_phase_1p57.png', dpi=150)
-    plt.show()
-
-
+# 结束
