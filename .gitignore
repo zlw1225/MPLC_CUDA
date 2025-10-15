@@ -2,4 +2,4 @@ old file/
 results/
 .venv/
 __pycache__/
-*.py[cod]
+*.pyc
