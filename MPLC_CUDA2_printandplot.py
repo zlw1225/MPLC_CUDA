@@ -1,5 +1,14 @@
-import math, torch, numpy as np, os, json
+import math, torch, numpy as np, os, json, argparse
 from utils import propagate_HK, performance_loc_fidelity, performance_crosstalk, performance_efficiency
+
+# 解析命令行参数
+parser = argparse.ArgumentParser(description='MPLC post-processing with configurable crop size')
+parser.add_argument('--nx_crop', type=int, default=256, help='Crop width (default: 256)')
+parser.add_argument('--ny_crop', type=int, default=512, help='Crop height (default: 512)')
+args = parser.parse_args()
+
+Nx_crop = args.nx_crop
+Ny_crop = args.ny_crop
 
 # 尝试从当前全局命名空间获取训练阶段对象；若不存在则从磁盘加载必需内容
 g = globals()
@@ -57,13 +66,10 @@ if missing:
 约定：训练脚本已保存 results/masks_full.pt (full 尺寸)。
 这里按用户需求：
   - baseline 使用内存中的 Masks (full)
-  - crop 尺寸固定 Nx_crop=256, Ny_crop=512 (中心裁剪)
+  - crop 尺寸可通过命令行参数 --nx_crop 和 --ny_crop 控制 (默认 256x512 中心裁剪)
   - 打印 IL/MDL/XTs/fidelity/crosstalk/efficiency，两组以及 ΔIL / ΔXTs
   - 生成 overview_full.png 与 overview_cropped.png
 """
-
-Nx_crop = 256
-Ny_crop = 512
 
 def central_crop(tensor, crop_h, crop_w):
     H = tensor.shape[-2]; W = tensor.shape[-1]
