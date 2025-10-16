@@ -1,5 +1,6 @@
 old file/
-results/
+resultso/
 .venv/
 __pycache__/
 *.pyc
+.ipynb_checkpoints
