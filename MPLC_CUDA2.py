@@ -89,11 +89,21 @@ def select_device() -> torch.device:
     return device
 
 
-def ensure_results_dir() -> str:
-    """确保结果输出目录存在，若不存在则创建并返回路径。"""
-    results_dir = os.path.join("results")
-    os.makedirs(results_dir, exist_ok=True)
+def ensure_results_dir(base_name="results") -> str:
+    """
+    确保结果输出目录存在。
+    若已存在同名文件夹，则自动创建 results_1, results_2 等新文件夹。
+    返回最终创建的目录路径。
+    """
+    results_dir = base_name
+    i = 1
+    # 若已存在，则递增命名
+    while os.path.exists(results_dir):
+        results_dir = f"{base_name}_{i}"
+        i += 1
+    os.makedirs(results_dir)
     return results_dir
+
 
 
 def write_run_meta(cfg: SimpleNamespace, device: torch.device, results_dir: str) -> None:

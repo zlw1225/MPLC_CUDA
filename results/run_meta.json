@@ -1,0 +1,33 @@
+{
+  "timestamp": "2025-10-21T17:34:38.941803",
+  "device": "cuda",
+  "torch_version": "2.8.0+cu128",
+  "torch_cuda": "12.8",
+  "numpy_version": "2.3.2",
+  "cfg": {
+    "n_of_modes": 10,
+    "Planes": 9,
+    "iterations": 1550,
+    "first_n_iterations": 10,
+    "Nx": 512,
+    "Ny": 1024,
+    "calc_perf_every_it": 10,
+    "equalize_efficiency": 1,
+    "plot_eff_distribution": 0,
+    "smoothing_switch": 1,
+    "plot_results": 0,
+    "preview_inputs": 1,
+    "do_padded_eval": 0,
+    "alpha": 1.0,
+    "beta": 2.0,
+    "gamma": 1.0,
+    "delta_theta_1": 0.02454369260617026,
+    "delta_theta_0": 0.2454369260617026,
+    "pixelSize": 8e-06,
+    "wavelength": 1.57e-06,
+    "d_in": 0.02,
+    "d": 0.0194,
+    "d_out": 0.015,
+    "OffsetMultiplier": 1.0
+  }
+}
