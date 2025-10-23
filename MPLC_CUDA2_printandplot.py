@@ -5,10 +5,28 @@ from utils import propagate_HK, performance_loc_fidelity, performance_crosstalk,
 parser = argparse.ArgumentParser(description='MPLC post-processing with configurable crop size')
 parser.add_argument('--nx_crop', type=int, default=256, help='Crop width (default: 256)')
 parser.add_argument('--ny_crop', type=int, default=512, help='Crop height (default: 512)')
+parser.add_argument('--output_folder', type=str, default='results', help='Output folder for results (default: results)')
+parser.add_argument('--quantize_pow', type=int, default=0, help='Quantize phase masks to 2^pow levels (0 disables quantization)')
+parser.add_argument('--masks_file', type=str, default='masks_full.pt', help='Mask file name to load (default: masks_full.pt)')
 args = parser.parse_args()
 
 Nx_crop = args.nx_crop
 Ny_crop = args.ny_crop
+output_folder = args.output_folder
+quantize_pow = max(0, args.quantize_pow)
+masks_file = args.masks_file
+crop_enabled = (Nx_crop > 0 and Ny_crop > 0)
+
+if not os.path.isdir(output_folder):
+    os.makedirs(output_folder, exist_ok=True)
+
+def quantize_masks(tensor, pow_level):
+    if pow_level <= 0:
+        return tensor
+    levels = 1 << pow_level
+    step = (2 * math.pi) / float(levels)
+    wrapped = torch.remainder(tensor + math.pi, 2 * math.pi) - math.pi
+    return torch.round(wrapped / step) * step
 
 # 尝试从当前全局命名空间获取训练阶段对象；若不存在则从磁盘加载必需内容
 g = globals()
@@ -19,15 +37,15 @@ if missing:
     if 'DEVICE' not in g:
         DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     try:
-        with open(os.path.join('results','run_meta.json'),'r',encoding='utf-8') as f:
+        with open(os.path.join(output_folder, 'run_meta.json'), 'r', encoding='utf-8') as f:
             meta = json.load(f)
-            cfg_loaded = meta.get('cfg',{})
-            pixelSize = cfg_loaded.get('pixelSize',8e-6)
-            Planes = cfg_loaded.get('Planes',9)
-            n_of_modes = cfg_loaded.get('n_of_modes',10)
-            d_in = cfg_loaded.get('d_in',20e-3)
-            d = cfg_loaded.get('d',2*9.7e-3)
-            d_out = cfg_loaded.get('d_out',15e-3)
+            cfg_loaded = meta.get('cfg', {})
+            pixelSize = cfg_loaded.get('pixelSize', 8e-6)
+            Planes = cfg_loaded.get('Planes', 9)
+            n_of_modes = cfg_loaded.get('n_of_modes', 10)
+            d_in = cfg_loaded.get('d_in', 20e-3)
+            d = cfg_loaded.get('d', 2 * 9.7e-3)
+            d_out = cfg_loaded.get('d_out', 15e-3)
     except Exception:
         pass
     # 基础波长数组（若缺失）
@@ -37,7 +55,7 @@ if missing:
         lambda_c = 1.57e-6
     # 加载相位
     if 'Masks' not in g:
-        Masks = torch.load('results/masks_full.pt', map_location=DEVICE, weights_only=True)
+        Masks = torch.load(os.path.join(output_folder, masks_file), map_location=DEVICE, weights_only=True)
     # 若模式与掩膜缺失：尝试加载原 .npz 并按训练脚本逻辑 pad 到当前 Masks 尺寸
     Ny_full, Nx_full = Masks.shape[-2], Masks.shape[-1]
     if 'LP_basis_torch' not in g or 'phi' not in g or 'Gaussian_Masks_torch' not in g:
@@ -60,6 +78,17 @@ if missing:
             LP_basis_torch = pad_complex(LP_basis_torch)
             phi = pad_complex(phi)
             Gaussian_Masks_torch = torch.nn.functional.pad(Gaussian_Masks_torch, pad_tuple)
+
+
+if 'Masks' not in globals():
+    raise RuntimeError('Masks tensor is required but could not be located.')
+
+Masks = quantize_masks(globals()['Masks'], quantize_pow)
+globals()['Masks'] = Masks
+if quantize_pow > 0:
+    unique_levels = torch.unique(torch.remainder(Masks + math.pi, 2 * math.pi)).numel()
+    levels_count = 1 << quantize_pow
+    print(f'[Quantize] Applied {levels_count}-level phase quantization (pow={quantize_pow}); unique levels observed: {unique_levels}.')
 
 
 """后处理：输出 full 与裁剪版本指标 + Overview 图。
@@ -174,7 +203,7 @@ def make_overview(masks_ph, LP_basis_ref, phi_ref, fname):
                 ax = axes[2,c]; ax.imshow(masks_ph[p].detach().cpu().numpy(), cmap='RdBu_r', origin='lower', vmin=-math.pi, vmax=math.pi); ax.axis('off')
         fig.suptitle(fname)
         fig.tight_layout()
-        fig.savefig(f'results/{fname}.png', dpi=150)
+        fig.savefig(os.path.join(output_folder, f'{fname}.png'), dpi=150)
         plt.close(fig)
 
 # ========== Full size metrics ==========
@@ -183,7 +212,19 @@ make_overview(Masks, LP_basis_torch, phi, 'overview_full')
 
 # ========== Cropped metrics ==========
 Ny_full, Nx_full = Masks.shape[-2], Masks.shape[-1]
-if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
+wl_list = [f'{wl*1e6:.3f}' for wl in lambda_list]
+def _fmt(arr):
+    return [f'{v:.3f}' for v in arr]
+
+print('Wavelengths (μm):', wl_list)
+print('[Full]    IL (dB):', _fmt(metrics_full['IL']))
+print('[Full]    XTs (dB):', _fmt(metrics_full['XTs']))
+print('[Full]    MDL (dB):', _fmt(metrics_full['MDL']))
+print('[Full]    fidelity :', _fmt(metrics_full['fid']))
+print('[Full]    crosstalk:', _fmt(metrics_full['crs']))
+print('[Full]    efficiency:', _fmt(metrics_full['eff']))
+
+if crop_enabled and Ny_full >= Ny_crop and Nx_full >= Nx_crop:
     Masks_crop = central_crop(Masks, Ny_crop, Nx_crop)
     LP_crop = central_crop(LP_basis_torch, Ny_crop, Nx_crop)
     phi_crop = central_crop(phi, Ny_crop, Nx_crop)
@@ -191,20 +232,11 @@ if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
     metrics_crop = eval_metrics(Masks_crop, LP_crop, phi_crop, Gmask_crop)
     make_overview(Masks_crop, LP_crop, phi_crop, 'overview_cropped')
     # 打印
-    wl_list = [f'{wl*1e6:.3f}' for wl in lambda_list]
-    print('Wavelengths (μm):', wl_list)
-    def _fmt(arr): return [f'{v:.3f}' for v in arr]
-    print('[Full]    IL (dB):', _fmt(metrics_full['IL']))
     print('[Cropped] IL (dB):', _fmt(metrics_crop['IL']))
-    print('[Full]    XTs (dB):', _fmt(metrics_full['XTs']))
     print('[Cropped] XTs (dB):', _fmt(metrics_crop['XTs']))
-    print('[Full]    MDL (dB):', _fmt(metrics_full['MDL']))
     print('[Cropped] MDL (dB):', _fmt(metrics_crop['MDL']))
-    print('[Full]    fidelity :', _fmt(metrics_full['fid']))
     print('[Cropped] fidelity :', _fmt(metrics_crop['fid']))
-    print('[Full]    crosstalk:', _fmt(metrics_full['crs']))
     print('[Cropped] crosstalk:', _fmt(metrics_crop['crs']))
-    print('[Full]    efficiency:', _fmt(metrics_full['eff']))
     print('[Cropped] efficiency:', _fmt(metrics_crop['eff']))
     # 差值（Cropped - Full）
     dIL = metrics_crop['IL'] - metrics_full['IL']
@@ -216,8 +248,8 @@ if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
     if abs(mean_dIL) < 0.1 and abs(mean_dXT) < 0.2:
         print('[Info] Crop impact negligible (ΔIL<0.1dB & ΔXTs<0.2dB).')
     # 保存裁剪相位
-    torch.save(Masks_crop.detach().cpu(), 'results/masks_cropped.pt')
-    print('[Save] Cropped phase masks saved to results/masks_cropped.pt')
+    torch.save(Masks_crop.detach().cpu(), os.path.join(output_folder, 'masks_cropped.pt'))
+    print(f'[Save] Cropped phase masks saved to {output_folder}/masks_cropped.pt')
 
     # ================== 仅对裁剪结果输出指定四类图像 ==================
     import matplotlib.pyplot as plt
@@ -235,7 +267,7 @@ if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
         axes_phase_flat[k].axis('off')
     fig_phase_maps.suptitle('Cropped phase masks (radians)')
     fig_phase_maps.tight_layout()
-    fig_phase_maps.savefig('results/masks_phase_maps.png', dpi=150)
+    fig_phase_maps.savefig(os.path.join(output_folder, 'masks_phase_maps.png'), dpi=150)
     plt.close(fig_phase_maps)
 
     # 2) 六个波长耦合矩阵 (coupling_matrices_6wls.png)
@@ -276,7 +308,7 @@ if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
             axes_cpl_flat[k].axis('off')
         fig_cpl.suptitle('Cropped coupling matrices |C|^2')
         fig_cpl.tight_layout()
-        fig_cpl.savefig('results/coupling_matrices_6wls.png', dpi=150)
+        fig_cpl.savefig(os.path.join(output_folder, 'coupling_matrices_6wls.png'), dpi=150)
         plt.close(fig_cpl)
 
     # 3) & 4) λ=1.57 μm 反向传播到 z=0 的每模式强度与相位
@@ -307,7 +339,7 @@ if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
             axes_bw_I_flat[k].axis('off')
         fig_bw_I.suptitle('Cropped backward z0 intensity (λ=1.57 μm)')
         fig_bw_I.tight_layout()
-        fig_bw_I.savefig('results/backward_z0_modes_1p57.png', dpi=150)
+        fig_bw_I.savefig(os.path.join(output_folder, 'backward_z0_modes_1p57.png'), dpi=150)
         plt.close(fig_bw_I)
         # 相位
         fig_bw_P, axes_bw_P = plt.subplots(nrows_bw, ncols_bw, figsize=(3*ncols_bw, 3*nrows_bw))
@@ -321,10 +353,13 @@ if Ny_full >= Ny_crop and Nx_full >= Nx_crop:
             axes_bw_P_flat[k].axis('off')
         fig_bw_P.suptitle('Cropped backward z0 phase (λ=1.57 μm)')
         fig_bw_P.tight_layout()
-        fig_bw_P.savefig('results/backward_z0_modes_phase_1p57.png', dpi=150)
+        fig_bw_P.savefig(os.path.join(output_folder, 'backward_z0_modes_phase_1p57.png'), dpi=150)
         plt.close(fig_bw_P)
 
+
+elif crop_enabled:
+    print(f'[Warn] Crop size {Ny_crop}x{Nx_crop} larger than full size {Ny_full}x{Nx_full}; skipping crop metrics.')
 else:
-    print('[Warn] Crop size larger than full size; skipping crop metrics.')
+    print(f'[Info] Crop metrics disabled (nx_crop={Nx_crop}, ny_crop={Ny_crop}).')
 
 # 结束
