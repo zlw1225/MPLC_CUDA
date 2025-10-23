@@ -64,7 +64,7 @@ def parse_cfg() -> SimpleNamespace:
     parser.add_argument("--pixelSize", type=float, default=8e-6)
     parser.add_argument("--wavelength", type=float, default=1.57e-6)
     parser.add_argument("--d_in", type=float, default=20e-3)
-    parser.add_argument("--d", type=float, default=2 * 9.7e-3)
+    parser.add_argument("--d", type=float, default=2 * 10)
     parser.add_argument("--d_out", type=float, default=15e-3)
     parser.add_argument("--OffsetMultiplier", type=float, default=1.0)
 
