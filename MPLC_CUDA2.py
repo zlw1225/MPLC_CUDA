@@ -53,6 +53,11 @@ def parse_cfg() -> SimpleNamespace:
     parser.add_argument("--equalize_efficiency", type=int, choices=[0, 1], default=1)
     parser.add_argument("--plot_eff_distribution", type=int, choices=[0, 1], default=0)
     parser.add_argument("--smoothing_switch", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--apply_freq_filtering", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--filter_d0_multiplier", type=float, default=1.25, 
+                       help="频域滤波器宽度倍数，实际宽度 = multiplier × (150/256) × Nx")
+    parser.add_argument("--filter_aspect_ratio", type=float, default=2.0, 
+                       help="滤波器长宽比（垂直/水平），空域Ny/Nx=2时，频域应为Ny/Nx的倒数，建议用2.0")
     parser.add_argument("--plot_results", type=int, choices=[0, 1], default=0)
     parser.add_argument("--preview_inputs", type=int, choices=[0, 1], default=1)
     parser.add_argument("--do_padded_eval", type=int, choices=[0, 1], default=0)
@@ -62,7 +67,7 @@ def parse_cfg() -> SimpleNamespace:
     parser.add_argument("--delta_theta_1", type=float, default=2 * math.pi / 256)
     parser.add_argument("--delta_theta_0", type=float, default=10 * (2 * math.pi / 256))
     parser.add_argument("--pixelSize", type=float, default=8e-6)
-    parser.add_argument("--wavelength", type=float, default=1.57e-6)
+    parser.add_argument("--wavelength", type=float, default=1.57e-6)#选谁都可以，反正生成时是按1550的就行。
     parser.add_argument("--d_in", type=float, default=20e-3)
     parser.add_argument("--d", type=float, default=2 * 10)
     parser.add_argument("--d_out", type=float, default=15e-3)
@@ -143,12 +148,12 @@ def build_frequency_grids(cfg: SimpleNamespace, device: torch.device) -> SimpleN
 def load_field_data(cfg: SimpleNamespace, device: torch.device) -> SimpleNamespace:
     """加载 LP 与高斯模数据，生成多波长字段及背景/交叉区域掩模。"""
     lambda_candidates = np.array([1.53e-6, 1.55e-6, 1.57e-6, 1.59e-6, 1.61e-6, 1.625e-6], dtype=np.float64)
-    lambda_c = 1.57e-6
+    lambda_c = cfg.wavelength  # 使用配置中的参考波长（生成 LP/Gaussian 数据时使用的波长）
 
     lp_data = np.load("lp_out_140.npz")
     lp_modes = lp_data["profiles"].astype(np.complex64)
 
-    gauss_data = np.load("gauss_10x1_70.npz")
+    gauss_data = np.load("gauss_5x2_70.npz")
     gauss_basis = gauss_data["Gaussian_basis"].astype(np.complex64)
     gauss_masks = gauss_data["Gaussian_Masks"].astype(np.float32)
 
@@ -304,7 +309,7 @@ def initialize_state(
 
     kz_list: List[torch.Tensor] = []
     modes_in0: List[torch.Tensor] = []
-    scls: List[float] = []
+    scls: List[float] = []  # 波长缩放因子：补偿反射式相位掩模在不同波长下的色散效应
 
     for l_idx, lambda_val in enumerate(data.lambda_list):
         k_val = float((2 * math.pi) / float(lambda_val))
@@ -315,6 +320,7 @@ def initialize_state(
         Modes_in[l_idx, 0] = propagate_HK(data.lp[l_idx], kz_c, cfg.d_in)
         Phi_bwd[l_idx, cfg.Planes - 1] = propagate_HK(data.phi[l_idx], kz_c, -cfg.d_out)
         modes_in0.append(Modes_in[l_idx, 0].clone())
+        # 波长缩放：固定刻蚀深度在波长 λ 下产生的相位 = 在 λ_c 下的相位 × (λ_c/λ)
         scls.append(float(data.lambda_c / float(lambda_val)))
 
     return SimpleNamespace(
@@ -333,8 +339,56 @@ def initialize_state(
     )
 
 
+def apply_frequency_filtering(mask: torch.Tensor, d0: float, aspect_ratio: float = 2.0) -> torch.Tensor:
+    """
+    应用频域超高斯滤波平滑相位掩模。
+    
+    原理：通过 FFT 变换到频域，乘以低通滤波器去除高频噪声，再 IFFT 回空域。
+    这样可以让相位分布更平滑，减少散射损耗，扩展工作带宽。
+    
+    参数:
+        mask: (Ny, Nx) 相位掩模张量，范围 [-π, π]
+        d0: 频域滤波器特征宽度（像素），越小越平滑，但性能可能下降
+        aspect_ratio: 滤波器长宽比（垂直/水平），用于匹配空域的反向特性
+                     空域竖长(Ny>Nx)时，频域应横长，需 aspect_ratio<1
+    
+    返回:
+        平滑后的相位掩模，形状与输入相同
+    """
+    Ny, Nx = mask.shape
+    device = mask.device
+    
+    # 1. FFT 变换到频域
+    mask_fft = torch.fft.fft2(mask)
+    mask_fft_shifted = torch.fft.fftshift(mask_fft)
+    
+    # 2. 构建频域超高斯滤波器（4阶）
+    # 频率坐标（归一化到像素单位）
+    fy = torch.fft.fftfreq(Ny, d=1.0, device=device) * Ny
+    fx = torch.fft.fftfreq(Nx, d=1.0, device=device) * Nx
+    FX, FY = torch.meshgrid(fx, fy, indexing='xy')
+    
+    # 4阶超高斯：exp(-((fx/fx0)^2 + (fy/fy0)^2)^4)
+    # 比普通高斯更"平顶"，过渡区更陡峭
+    # 注意：空域窄的方向，频域应该宽（反向关系）
+    fy_cutoff = d0 * aspect_ratio  # 垂直方向
+    fx_cutoff = d0                  # 水平方向（基准）
+    filter_freq = torch.exp(-((FX / fx_cutoff)**2 + (FY / fy_cutoff)**2)**4)
+    
+    # 3. 频域相乘（低通滤波）
+    mask_filtered_fft = mask_fft_shifted * filter_freq
+    
+    # 4. IFFT 变回空域
+    mask_smooth = torch.fft.ifft2(torch.fft.ifftshift(mask_filtered_fft)).real
+    
+    return mask_smooth
+
+
 def build_mask_cache(Masks: torch.Tensor, scls: List[float]) -> List[List[torch.Tensor]]:
-    """按波长缩放系数缓存各平面相位掩模，避免重复指数计算。"""
+    """按波长缩放系数缓存各平面相位掩模，避免重复指数计算。
+    
+    scl 补偿反射式掩模色散：固定刻蚀深度 h 在不同波长 λ 下产生相位 φ(λ) = φ₀ × (λ_c/λ)
+    """
     Planes = Masks.shape[0]
     cache: List[List[torch.Tensor]] = []
     for scl in scls:
@@ -350,11 +404,11 @@ def evaluate_performance(cfg: SimpleNamespace, data: SimpleNamespace, state: Sim
     eff_lists = []
     for l_idx, _ in enumerate(data.lambda_list):
         kz_l = state.kz_list[l_idx]
-        scl = state.scls[l_idx]
+        scl = state.scls[l_idx]  # 波长缩放因子 λ_c/λ，用于相位掩模色散补偿
         modes = propagate_HK(data.lp[l_idx], kz_l, cfg.d_in)
         for pl in range(cfg.Planes - 1):
-            modes = modes * torch.exp(1j * (state.Masks[pl] * scl))
-            modes = propagate_HK(modes, kz_l, cfg.d)
+            modes = modes * torch.exp(1j * (state.Masks[pl] * scl))  # 相位掩模：用 scl 补偿波长色散
+            modes = propagate_HK(modes, kz_l, cfg.d)  # 自由传播：用真实 kz，无需补偿
         modes = modes * torch.exp(1j * (state.Masks[cfg.Planes - 1] * scl))
         eout = propagate_HK(modes, kz_l, cfg.d_out)
         intensity = torch.abs(eout) ** 2
@@ -451,6 +505,17 @@ def optimize_phase_masks(cfg: SimpleNamespace, data: SimpleNamespace, state: Sim
                 state.Masks[mask_idx] = torch.angle(mask_complex)
             else:
                 state.Masks[mask_idx] = state.Masks[mask_idx] + delta_P
+
+            # 频域滤波平滑（在掩模更新后立即应用）
+            if cfg.apply_freq_filtering == 1:
+                # 计算实际滤波器宽度：multiplier × (150/256) × Nx
+                # 例如：multiplier=1.25, Nx=256 → d0 = 1.25 × 150 = 187.5
+                d0_actual = cfg.filter_d0_multiplier * 150.0 * (cfg.Nx / 256.0)
+                state.Masks[mask_idx] = apply_frequency_filtering(
+                    state.Masks[mask_idx],
+                    d0=d0_actual,
+                    aspect_ratio=cfg.filter_aspect_ratio
+                )
 
             state.Masks_complex[mask_idx] = torch.exp(1j * state.Masks[mask_idx])
             for l_idx, scl in enumerate(state.scls):
