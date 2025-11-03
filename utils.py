@@ -105,23 +105,14 @@ def propagate_HK(FieldIn: Union[np.ndarray, torch.Tensor], kz: Union[np.ndarray,
 @propagate_HK.register
 def _(FieldIn: np.ndarray, kz: np.ndarray, distance: float = 0.0) -> np.ndarray:
     FieldIn_FT = fft2(FieldIn)
-    # k-space filter (1是无过滤)
-    k_filter = 1
-    k_max = np.max(np.abs(kz))
-    mask = (np.abs(kz) < k_filter * k_max)
-
-    FieldOut_FT = FieldIn_FT*np.exp(1j*kz*distance)*(np.imag(kz)==0) * mask
+    FieldOut_FT = FieldIn_FT*np.exp(1j*kz*distance)*(np.imag(kz)==0)
     FieldOut = ifft2(FieldOut_FT)
     return FieldOut
 
 @propagate_HK.register
 def _(FieldIn: torch.Tensor, kz: torch.Tensor, distance: float = 0.0) -> torch.Tensor:
     FieldIn_FT = fft2(FieldIn)
-    k_filter = 1
-    k_max = torch.max(torch.abs(kz))
-    mask = (torch.abs(kz) < k_filter * k_max)
-
-    FieldOut_FT = FieldIn_FT*torch.exp(1j*kz*distance)*(torch.imag(kz)==0) * mask
+    FieldOut_FT = FieldIn_FT*torch.exp(1j*kz*distance)*(torch.imag(kz)==0)
     FieldOut = ifft2(FieldOut_FT)
     return FieldOut
 

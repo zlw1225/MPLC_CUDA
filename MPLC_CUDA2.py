@@ -53,7 +53,7 @@ def parse_cfg() -> SimpleNamespace:
     parser.add_argument("--equalize_efficiency", type=int, choices=[0, 1], default=1)
     parser.add_argument("--plot_eff_distribution", type=int, choices=[0, 1], default=0)
     parser.add_argument("--smoothing_switch", type=int, choices=[0, 1], default=1)
-    parser.add_argument("--apply_freq_filtering", type=int, choices=[0, 1], default=1)
+    parser.add_argument("--apply_freq_filtering", type=int, choices=[0, 1], default=0)
     parser.add_argument("--filter_d0_multiplier", type=float, default=1.25, 
                        help="频域滤波器宽度倍数，实际宽度 = multiplier × (150/256) × Nx")
     parser.add_argument("--filter_aspect_ratio", type=float, default=2.0, 
@@ -69,7 +69,7 @@ def parse_cfg() -> SimpleNamespace:
     parser.add_argument("--pixelSize", type=float, default=8e-6)
     parser.add_argument("--wavelength", type=float, default=1.57e-6)#选谁都可以，反正生成时是按1550的就行。
     parser.add_argument("--d_in", type=float, default=20e-3)
-    parser.add_argument("--d", type=float, default=2 * 10)
+    parser.add_argument("--d", type=float, default=2 * 10e-3)
     parser.add_argument("--d_out", type=float, default=15e-3)
     parser.add_argument("--OffsetMultiplier", type=float, default=1.0)
 
@@ -136,13 +136,26 @@ def runtime_constants(cfg: SimpleNamespace) -> SimpleNamespace:
 
 def build_frequency_grids(cfg: SimpleNamespace, device: torch.device) -> SimpleNamespace:
     """构建频域网格与平方波数张量，以供角谱传播使用。"""
-    nx_t = torch.linspace(-(cfg.Nx - 1) / 2, (cfg.Nx - 1) / 2, steps=cfg.Nx, device=device, dtype=torch.float32)
-    ny_t = torch.linspace(-(cfg.Ny - 1) / 2, (cfg.Ny - 1) / 2, steps=cfg.Ny, device=device, dtype=torch.float32)
+
+    # 1) 构造空间索引
+    nx_t = torch.arange(cfg.Nx, device=device, dtype=torch.float32) - cfg.Nx // 2
+    ny_t = torch.arange(cfg.Ny, device=device, dtype=torch.float32) - cfg.Ny // 2
+
+    # 2) 手动构造 kx, ky (rad/m)
     kx_1d = (2 * math.pi) * nx_t / (cfg.Nx * cfg.pixelSize)
     ky_1d = (2 * math.pi) * ny_t / (cfg.Ny * cfg.pixelSize)
+
+    # 3) 构造二维网格
     kx_t, ky_t = torch.meshgrid(kx_1d, ky_1d, indexing="xy")
     k_sq = kx_t ** 2 + ky_t ** 2
-    return SimpleNamespace(nx=nx_t, ny=ny_t, k_sq=k_sq)
+
+    # ✅ 输出与 fftshift(fftfreq) 完全一致
+    # Nx=9, Ny=6, dx=1e-06 m
+    # tensor([0., 1., 2., 3., 4., 5., 6., 7., 8.], dtype=torch.float64)
+    # Nx//2: 4
+    # nx_t: tensor([-4., -3., -2., -1.,  0.,  1.,  2.,  3.,  4.], dtype=torch.float64)
+    # ny_t: tensor([-3., -2., -1.,  0.,  1.,  2.], dtype=torch.float64)
+    return SimpleNamespace(nx=nx_t, ny=ny_t, kx=kx_1d, ky=ky_1d, k_sq=k_sq)
 
 
 def load_field_data(cfg: SimpleNamespace, device: torch.device) -> SimpleNamespace:
@@ -362,11 +375,11 @@ def apply_frequency_filtering(mask: torch.Tensor, d0: float, aspect_ratio: float
     mask_fft = torch.fft.fft2(mask)
     mask_fft_shifted = torch.fft.fftshift(mask_fft)
     
-    # 2. 构建频域超高斯滤波器（4阶）
-    # 频率坐标（归一化到像素单位）
-    fy = torch.fft.fftfreq(Ny, d=1.0, device=device) * Ny
-    fx = torch.fft.fftfreq(Nx, d=1.0, device=device) * Nx
-    FX, FY = torch.meshgrid(fx, fy, indexing='xy')
+     # 构造像素空间的频率索引（以像素为单位），中心化
+    # range: -Nx/2 ... Nx/2-1
+    fx_idx = (torch.arange(Nx, device=mask.device, dtype=torch.float32) - Nx//2)
+    fy_idx = (torch.arange(Ny, device=mask.device, dtype=torch.float32) - Ny//2)
+    FX, FY = torch.meshgrid(fx_idx, fy_idx, indexing='xy')  # shape (Ny,Nx)
     
     # 4阶超高斯：exp(-((fx/fx0)^2 + (fy/fy0)^2)^4)
     # 比普通高斯更"平顶"，过渡区更陡峭
@@ -380,9 +393,8 @@ def apply_frequency_filtering(mask: torch.Tensor, d0: float, aspect_ratio: float
     
     # 4. IFFT 变回空域
     mask_smooth = torch.fft.ifft2(torch.fft.ifftshift(mask_filtered_fft)).real
-    
-    return mask_smooth
 
+    return mask_smooth
 
 def build_mask_cache(Masks: torch.Tensor, scls: List[float]) -> List[List[torch.Tensor]]:
     """按波长缩放系数缓存各平面相位掩模，避免重复指数计算。

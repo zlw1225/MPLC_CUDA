@@ -157,7 +157,7 @@ if missing:
         
         # 从 .npz 文件加载（这些文件由数据生成脚本创建）
         lp_data = np.load('lp_out_140.npz')      # LP 模式数据
-        gauss_data = np.load('gauss_10x1_70.npz')  # 高斯模式数据
+        gauss_data = np.load('gauss_5x2_70.npz')  # 高斯模式数据
         
         # 提取前 n_of_modes 个模式
         lp_modes = lp_data['profiles'][:, 0:n_of_modes]           # 输入 LP 模式
