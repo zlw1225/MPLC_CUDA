@@ -137,11 +137,11 @@ def runtime_constants(cfg: SimpleNamespace) -> SimpleNamespace:
 def build_frequency_grids(cfg: SimpleNamespace, device: torch.device) -> SimpleNamespace:
     """构建频域网格与平方波数张量，以供角谱传播使用。"""
 
-    # 1) 构造空间索引
+    # 1) 构造空间角频率索引
     nx_t = torch.arange(cfg.Nx, device=device, dtype=torch.float32) - cfg.Nx // 2
     ny_t = torch.arange(cfg.Ny, device=device, dtype=torch.float32) - cfg.Ny // 2
 
-    # 2) 手动构造 kx, ky (rad/m)
+    # 2) 手动构造空间角频率的取值范围 kx, ky (rad/m)
     kx_1d = (2 * math.pi) * nx_t / (cfg.Nx * cfg.pixelSize)
     ky_1d = (2 * math.pi) * ny_t / (cfg.Ny * cfg.pixelSize)
 
@@ -330,7 +330,7 @@ def initialize_state(
         kz_c = torch.sqrt(kz_sq.to(torch.complex64))
         kz_list.append(kz_c)
 
-        Modes_in[l_idx, 0] = propagate_HK(data.lp[l_idx], kz_c, cfg.d_in)
+        Modes_in[l_idx, 0] = propagate_HK(data.lp[l_idx], kz_c, cfg.d_in) 
         Phi_bwd[l_idx, cfg.Planes - 1] = propagate_HK(data.phi[l_idx], kz_c, -cfg.d_out)
         modes_in0.append(Modes_in[l_idx, 0].clone())
         # 波长缩放：固定刻蚀深度在波长 λ 下产生的相位 = 在 λ_c 下的相位 × (λ_c/λ)
