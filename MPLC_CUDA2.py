@@ -10,6 +10,8 @@ MPLC_CUDA2 模块实现了基于 CUDA 加速的多平面光学转换 (MPLC) 优�
 - 定期评估定位保真度、串扰和效率，执行效率均衡与平滑处理，最终保存最优相位掩模及指标报表。
 
 在实现中，重要环节包括 `optimize_phase_masks` 中的内外循环传播、梯度近似与掩模更新逻辑，以及 `evaluate_performance` 用于多波长性能统计的流程。
+python MPLC_CUDA2.py --lp_data_file "lp_out_140.npz" --gauss_data_file "gauss_5x2_70.npz"
+python MPLC_CUDA2.py --lp_data_file "lp_6_out_140.npz" --gauss_data_file "gauss_6x1_70.npz" --n_of_modes 6
 """
 
 from __future__ import annotations
@@ -43,6 +45,8 @@ from utils import (
 def parse_cfg() -> SimpleNamespace:
     """解析命令行参数并返回包含默认值配置的命名空间。"""
     parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--lp_data_file", type=str, default="lp_out_140.npz")
+    parser.add_argument("--gauss_data_file", type=str, default="gauss_5x2_70.npz")
     parser.add_argument("--n_of_modes", type=int, default=10)
     parser.add_argument("--Planes", type=int, default=9)
     parser.add_argument("--iterations", type=int, default=1550)
@@ -163,10 +167,10 @@ def load_field_data(cfg: SimpleNamespace, device: torch.device) -> SimpleNamespa
     lambda_candidates = np.array([1.53e-6, 1.55e-6, 1.57e-6, 1.59e-6, 1.61e-6, 1.625e-6], dtype=np.float64)
     lambda_c = cfg.wavelength  # 使用配置中的参考波长（生成 LP/Gaussian 数据时使用的波长）
 
-    lp_data = np.load("lp_out_140.npz")
+    lp_data = np.load(cfg.lp_data_file)
     lp_modes = lp_data["profiles"].astype(np.complex64)
 
-    gauss_data = np.load("gauss_5x2_70.npz")
+    gauss_data = np.load(cfg.gauss_data_file)
     gauss_basis = gauss_data["Gaussian_basis"].astype(np.complex64)
     gauss_masks = gauss_data["Gaussian_Masks"].astype(np.float32)
 
