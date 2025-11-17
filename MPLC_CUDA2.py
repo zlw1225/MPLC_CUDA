@@ -67,7 +67,7 @@ def parse_cfg() -> SimpleNamespace:
     parser.add_argument("--delta_theta_1", type=float, default=2 * math.pi / 256)
     parser.add_argument("--delta_theta_0", type=float, default=10 * (2 * math.pi / 256))
     parser.add_argument("--pixelSize", type=float, default=8e-6)
-    parser.add_argument("--wavelength", type=float, default=1.57e-6)#选谁都可以，反正生成时是按1550的就行。
+    parser.add_argument("--wavelength", type=float, default=1.55e-6)#选谁都可以，反正生成时是按1550的就行。
     parser.add_argument("--d_in", type=float, default=20e-3)
     parser.add_argument("--d", type=float, default=2 * 10e-3)
     parser.add_argument("--d_out", type=float, default=15e-3)
